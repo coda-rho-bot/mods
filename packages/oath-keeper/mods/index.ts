@@ -3,10 +3,14 @@
  *
  * "Cron is for things you plan. Oath Keeper is for things you promise."
  *
- * Architecture (dual-mode):
- * - If events.turns available: turn_end handler (Cameron's approach)
- * - If not (desktop app, channels): setInterval polling fallback
+ * Architecture:
+ * - Detection: turn_end (CLI v0.27.25+) + setInterval polling (desktop/listener)
+ * - Delivery: queued state + API POST with 409 retry
  * - State: local JSON file with builder-pattern StateStore
+ *
+ * CLI LIMITATION: Oath delivery fires into the conversation via API POST.
+ * The delivery appears in the desktop app. CLI may not display it until
+ * the next user message or CLI restart.
  */
 
 import fs from "node:fs";
@@ -17,6 +21,7 @@ const HOME = os.homedir();
 const STATE_FILE = `${HOME}/.letta/mods/oath-keeper.state.json`;
 const ENV_FILE = `${HOME}/.letta/extensions/oath-env.json`;
 const DEBUG_FILE = `${HOME}/.letta/mods/oath-keeper-debug.json`;
+const FALSE_POSITIVE_FILE = `${HOME}/.letta/mods/oath-keeper-false-positives.json`;
 const POLL_INTERVAL_MS = 15_000;
 const DELAY_MS = 60_000;
 
@@ -25,12 +30,9 @@ function log(msg: string) {
   addDebugLog(msg);
 }
 
-// ─── Debug log (readable by TUI) ─────────────────────────────────
+// ─── Debug log ───────────────────────────────────────────────────
 
-interface DebugEntry {
-  ts: number;
-  msg: string;
-}
+interface DebugEntry { ts: number; msg: string; }
 
 function addDebugLog(msg: string) {
   try {
@@ -38,14 +40,10 @@ function addDebugLog(msg: string) {
     const raw = fs.readFileSync(DEBUG_FILE, "utf8");
     const entries: DebugEntry[] = JSON.parse(raw);
     entries.push(entry);
-    // Keep last 50 entries
-    while (entries.length > 50) entries.shift();
+    while (entries.length > 500) entries.shift();
     fs.writeFileSync(DEBUG_FILE, JSON.stringify(entries, null, 2));
   } catch (e) {
-    // First write — create the file
-    try {
-      fs.writeFileSync(DEBUG_FILE, JSON.stringify([{ ts: Date.now(), msg }], null, 2));
-    } catch (e2) {}
+    try { fs.writeFileSync(DEBUG_FILE, JSON.stringify([{ ts: Date.now(), msg }], null, 2)); } catch (e2) {}
   }
 }
 
@@ -58,6 +56,7 @@ interface Oath {
   promise: string;
   context: string;
   sourceMessageId?: string;
+  deliveryMode?: "turn_end" | "polling";
   createdAt: number;
   dueAt: number;
   status: "pending" | "queued" | "delivering" | "delivered" | "failed";
@@ -71,33 +70,19 @@ interface StateData {
   _pollVer: string;
 }
 
-/**
- * StateStore — builder pattern that forces saves.
- * load() returns a Transaction that MUST be committed via save().
- * If you mutate state without calling save(), the data is lost and
- * an error is logged on the next load (dirty flag check).
- */
 class StateStore {
   private data: StateData;
   private dirty: boolean = false;
   private saved: boolean = false;
   private operation: string;
 
-  private constructor(data: StateData, operation: string) {
-    this.data = data;
-    this.operation = operation;
-  }
+  private constructor(data: StateData, operation: string) { this.data = data; this.operation = operation; }
 
   static load(operation: string): StateStore {
     let data: StateData;
     try {
-      const raw = fs.readFileSync(STATE_FILE, "utf8");
-      const parsed = JSON.parse(raw);
-      data = {
-        oaths: parsed.oaths || [],
-        lastScannedMessageId: parsed.lastScannedMessageId || null,
-        _pollVer: parsed._pollVer || "",
-      };
+      const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+      data = { oaths: parsed.oaths || [], lastScannedMessageId: parsed.lastScannedMessageId || null, _pollVer: parsed._pollVer || "" };
     } catch (e) {
       data = { oaths: [], lastScannedMessageId: null, _pollVer: "" };
     }
@@ -105,106 +90,46 @@ class StateStore {
     return new StateStore(data, operation);
   }
 
-  /** Find an oath by ID */
-  findOath(id: string): Oath | undefined {
-    return this.data.oaths.find((o) => o.id === id);
-  }
-
-  /** Update an oath's status. Marks the store as dirty. */
+  findOath(id: string): Oath | undefined { return this.data.oaths.find((o) => o.id === id); }
   updateOath(id: string, updates: Partial<Oath>): StateStore {
     const oath = this.findOath(id);
-    if (!oath) {
-      log(`StateStore.updateOath("${id}") — OATH NOT FOUND`);
-      return this;
-    }
-    const oldStatus = oath.status;
+    if (!oath) return this;
     Object.assign(oath, updates);
     this.dirty = true;
-    log(`StateStore.updateOath("${id}") — status: ${oldStatus} -> ${oath.status}`);
+    log(`StateStore.updateOath("${id}") — ${Object.keys(updates).join(",")}`);
     return this;
   }
-
-  /** Add a new oath. Marks the store as dirty. */
-  addOath(oath: Oath): StateStore {
-    this.data.oaths.push(oath);
-    this.dirty = true;
-    log(`StateStore.addOath("${oath.id}") — promise: "${oath.promise.slice(0, 40)}..."`);
-    return this;
-  }
-
-  /** Set the last scanned message ID */
-  setScanned(msgId: string): StateStore {
-    this.data.lastScannedMessageId = msgId;
-    this.dirty = true;
-    return this;
-  }
-
-  /** Prune old oaths (keep last 24h) */
+  addOath(oath: Oath): StateStore { this.data.oaths.push(oath); this.dirty = true; log(`StateStore.addOath("${oath.id}")`); return this; }
+  setScanned(msgId: string): StateStore { this.data.lastScannedMessageId = msgId; this.dirty = true; return this; }
+  setPollVer(ver: string): StateStore { this.data._pollVer = ver; this.dirty = true; return this; }
   prune(now: number): StateStore {
     const before = this.data.oaths.length;
     this.data.oaths = this.data.oaths.filter((o) =>
       o.status === "pending" || o.status === "queued" || o.status === "delivering" ||
       (o.deliveredAt && (now - o.deliveredAt) < 86_400_000)
     );
-    if (this.data.oaths.length !== before) {
-      this.dirty = true;
-      log(`StateStore.prune() — ${before} -> ${this.data.oaths.length} oaths`);
-    }
+    if (this.data.oaths.length !== before) this.dirty = true;
     return this;
   }
+  get oaths(): Oath[] { return this.data.oaths; }
+  get lastScannedMessageId(): string | null { return this.data.lastScannedMessageId; }
+  get pollVer(): string { return this.data._pollVer; }
+  hasActiveOaths(): boolean { return this.data.oaths.some((o) => o.status === "pending" || o.status === "queued" || o.status === "delivering"); }
 
-  /** Set poll version marker */
-  setPollVer(ver: string): StateStore {
-    this.data._pollVer = ver;
-    this.dirty = true;
-    return this;
+  /** Strong dedup: returns true if an oath with the same promise text exists from the last N minutes */
+  hasRecentPromise(promiseText: string, withinMs: number = 300_000): boolean {
+    const now = Date.now();
+    const snippet = promiseText.slice(0, 60).toLowerCase();
+    return this.data.oaths.some((o) =>
+      o.createdAt > (now - withinMs) &&
+      o.promise.toLowerCase().includes(snippet)
+    );
   }
 
-  /** Get read-only access to oaths */
-  get oaths(): Oath[] {
-    return this.data.oaths;
-  }
-
-  get lastScannedMessageId(): string | null {
-    return this.data.lastScannedMessageId;
-  }
-
-  get pollVer(): string {
-    return this.data._pollVer;
-  }
-
-  /** Check if any oaths are pending or delivering */
-  hasActiveOaths(): boolean {
-    return this.data.oaths.some((o) => o.status === "pending" || o.status === "queued" || o.status === "delivering");
-  }
-
-  /**
-   * Save the state to disk. MUST be called after any mutations.
-   * If the store was dirty but not saved, logs an error.
-   */
   save(): void {
-    if (!this.dirty) {
-      log(`StateStore.save() — nothing to save (not dirty)`);
-      this.saved = true;
-      return;
-    }
-    try {
-      fs.writeFileSync(STATE_FILE, JSON.stringify(this.data, null, 2));
-      this.saved = true;
-      log(`StateStore.save() — SAVED after "${this.operation}"`);
-    } catch (e) {
-      log(`StateStore.save() — FAILED: ${e}`);
-    }
-  }
-
-  /** Check if save was called (for debugging) */
-  get isSaved(): boolean {
-    return this.saved;
-  }
-
-  /** Check if there are unsaved mutations */
-  get isDirty(): boolean {
-    return this.dirty;
+    if (!this.dirty) { this.saved = true; return; }
+    try { fs.writeFileSync(STATE_FILE, JSON.stringify(this.data, null, 2)); this.saved = true; log(`StateStore.save() — SAVED after "${this.operation}"`); }
+    catch (e) { log(`StateStore.save() — FAILED: ${e}`); }
   }
 }
 
@@ -230,156 +155,228 @@ function detectPromiseRegex(text: string): { promise: string } | null {
 
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) {
-      const start = match.index || 0;
-      const sentStart = text.lastIndexOf(".", start) + 1;
-      const sentEnd = text.indexOf(".", start + match[0].length);
-      const end = sentEnd === -1 ? text.length : sentEnd + 1;
-      const promise = text.slice(sentStart, end).trim();
-      if (promise.length > 10 && promise.length < 300) {
-        return { promise };
-      }
-    }
+    if (match) return { match: match[0] };
   }
   return null;
+}
+
+/**
+ * LLM confirmation — given a candidate message that matched the regex pre-filter,
+ * ask the LLM to confirm whether it's a genuine promise to follow up later.
+ * Returns the specific promise text or null if not a real promise.
+ */
+/** Log a false positive as a failed oath in the state file (deduplicated) */
+function logFalsePositive(matchedPattern: string, text: string, source: string) {
+  try {
+    const store = StateStore.load("false-positive");
+    // Deduplicate — skip if a false positive with the same text already exists
+    const textSnippet = text.slice(0, 60);
+    const exists = store.oaths.some((o) =>
+      o.status === "failed" &&
+      o.result === "LLM rejected — not a genuine promise" &&
+      o.promise.includes(textSnippet)
+    );
+    if (exists) { log("False positive already logged — skipping duplicate"); return; }
+    const now = Date.now();
+    store.addOath({
+      id: "fp-" + now + "-" + Math.random().toString(36).slice(2, 6),
+      conversationId: "",
+      agentId: "",
+      promise: "[FALSE POSITIVE] " + matchedPattern + ": " + text.slice(0, 60),
+      context: text.slice(0, 200),
+      createdAt: now,
+      dueAt: now,
+      status: "failed",
+      result: "LLM rejected — not a genuine promise",
+      deliveredAt: now,
+    });
+    store.save();
+    log("False positive logged as failed oath: " + matchedPattern);
+  } catch (e) {
+    log("Failed to log false positive: " + e);
+  }
+}
+
+/**
+ * LLM confirmation — given a candidate message that matched the regex pre-filter,
+ * ask the LLM to confirm whether it's a genuine promise to follow up later.
+ * Returns the specific promise text or null if not a real promise.
+ */
+async function confirmPromise(text: string): Promise<{ promise: string } | null> {
+  const { baseUrl, apiKey, agentId } = getApiConfig();
+  if (!agentId) return null;
+
+  // Truncate to keep the classification fast
+  const snippet = text.slice(0, 1000);
+  const classificationPrompt =
+    'You are a promise detector. Read this assistant message and determine:\n'
+    + 'Does the assistant make a GENUINE promise to do something AFTER the current response?\n\n'
+    + 'Rules:\n'
+    + '- YES = agent commits to following up later (e.g., "I\'ll get back to you after I check")\n'
+    + '- YES = agent says "I\'ll tell you X in 60 seconds" — the "in 60 seconds" means it will happen LATER\n'
+    + '- YES = agent mentions a specific time delay ("in N minutes/seconds", "later", "after")\n'
+    + '- NO = agent is doing it right now with no delay (e.g., "I\'ll tell you the time" immediately followed by the actual answer with no time gap)\n'
+    + '- NO = quoting or explaining what someone else said\n'
+    + '- NO = describing how the mod works\n'
+    + '- NO = hypothetical examples\n\n'
+    + 'Message:\n"""' + snippet + '"""\n\n'
+    + 'Respond with ONLY a JSON object:\n'
+    + '- Genuine promise: {"is_promise": true, "promise": "<what they specifically promise to do>"}\n'
+    + '- Not a promise: {"is_promise": false}';
+
+  try {
+    // Create throwaway conversation for classification
+    const convResp = await fetch(
+      baseUrl + "/v1/conversations?agent_id=" + agentId,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: "Bearer " + apiKey } : {}) },
+        body: "{}",
+      }
+    );
+    if (!convResp.ok) { log("confirmPromise: could not create conversation"); return null; }
+    const convData: any = await convResp.json();
+    const classConvId = convData.id || "";
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    const resp = await fetch(
+      baseUrl + "/v1/conversations/" + classConvId + "/messages",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: "Bearer " + apiKey } : {}) },
+        body: JSON.stringify({ input: classificationPrompt, role: "user" }),
+        signal: controller.signal,
+      }
+    );
+    clearTimeout(timeout);
+
+    // Cleanup conversation regardless of result
+    try {
+      await fetch(baseUrl + "/v1/conversations/" + classConvId, {
+        method: "DELETE",
+        headers: apiKey ? { Authorization: "Bearer " + apiKey } : {},
+      });
+    } catch (e) {}
+
+    if (!resp.ok) { log("confirmPromise: classification API " + resp.status); return null; }
+
+    const respText = await resp.text();
+    let answer = "";
+    for (const line of respText.split("\n")) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6);
+      if (data === "[DONE]") break;
+      try {
+        const d = JSON.parse(data);
+        if (d.message_type === "assistant_message" && d.content) {
+          answer = String(d.content).slice(0, 2000);
+          break;
+        }
+      } catch (e) {}
+    }
+
+    if (!answer) { log("confirmPromise: no response from LLM"); return null; }
+
+    // Parse the JSON response
+    const jsonMatch = answer.match(/\{[^}]*\}/);
+    if (!jsonMatch) { log("confirmPromise: no JSON in response: " + answer.slice(0, 100)); return null; }
+
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (parsed.is_promise === true && parsed.promise && typeof parsed.promise === "string") {
+      log("confirmPromise: CONFIRMED — " + parsed.promise.slice(0, 60));
+      return { promise: parsed.promise.slice(0, 300) };
+    }
+    log("confirmPromise: REJECTED — not a genuine promise");
+    return null;
+  } catch (e) {
+    log("confirmPromise error: " + e);
+    return null;
+  }
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function buildDeliveryPrompt(oath: Oath): string {
-  return '[Oath Keeper] You previously promised the user:\n"'
-    + oath.promise + '"\n\nDeliver on your promise now. '
-    + 'Answer directly. If you need to check something, use Bash — not web_search. '
-    + 'Keep it to 1-3 sentences. Start your response with "[Oath Delivered]".';
+  return '[Oath Keeper] You previously promised the user:\n"' + oath.promise +
+    '"\n\nDeliver on your promise now. Answer directly. If you need to check something, use Bash — not web_search. ' +
+    'Keep it to 1-3 sentences. Start your response with "[Oath Delivered]".';
 }
 
-function createOath(promise: string, context: string, conversationId: string, agentId: string, sourceMessageId?: string): Oath {
+function createOath(promise: string, context: string, conversationId: string, agentId: string, sourceMessageId?: string, deliveryMode?: "turn_end" | "polling"): Oath {
   const now = Date.now();
-  return {
-    id: "oath-" + now + "-" + Math.random().toString(36).slice(2, 8),
-    conversationId,
-    agentId,
-    promise,
-    context,
-    createdAt: now,
-    dueAt: now + DELAY_MS,
-    status: "pending",
-    result: null,
-    deliveredAt: null,
-    sourceMessageId,
-  };
+  return { id: "oath-" + now + "-" + Math.random().toString(36).slice(2, 8), conversationId, agentId, promise, context, sourceMessageId, deliveryMode, createdAt: now, dueAt: now + DELAY_MS, status: "pending", result: null, deliveredAt: null };
 }
 
 function getApiConfig() {
-  // The port changes on every app restart. process.env may have a stale port.
-  // ALWAYS read baseUrl from the env file (kept updated by update-oath-env.sh).
-  // For agentId/convId, use process.env if available, fall back to env file.
   let apiKey = process.env.LETTA_API_KEY;
   if (apiKey === "unset") apiKey = undefined;
-  let agentId = process.env.LETTA_AGENT_ID || "";
-  let convId = process.env.LETTA_CONVERSATION_ID || "";
-  if (agentId === "unset") agentId = "";
-  if (convId === "unset") convId = "";
-
-  // ALWAYS read baseUrl from env file first
   let baseUrl = "";
+  let agentId = "";
+  let convId = "";
+
+  // ALWAYS read from env file first — process.env in the listener process
+  // belongs to a DIFFERENT agent (the Telegram channel adapter's agent).
+  // The env file is the source of truth for which conversation to watch.
   try {
     const env = JSON.parse(fs.readFileSync(ENV_FILE, "utf8"));
     baseUrl = env.LETTA_BASE_URL || "";
-    agentId = agentId || env.LETTA_AGENT_ID || "";
-    convId = convId || env.LETTA_CONVERSATION_ID || "";
+    agentId = env.LETTA_AGENT_ID || "";
+    convId = env.LETTA_CONVERSATION_ID || "";
   } catch (e) {}
 
-  // If no baseUrl from env file, discover it dynamically
+  // Dynamic port discovery if env file is stale
   if (!baseUrl) {
-    try {
-      const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\.0\\.0\\.1:\\K\\d+'", { encoding: "utf8", timeout: 2000 }).trim();
-      if (output) baseUrl = "http://localhost:" + output;
-    } catch (e) {}
+    try { const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\.0\\.0\\.1:\\K\\d+'", { encoding: "utf8", timeout: 2000 }).trim(); if (output) baseUrl = "http://localhost:" + output; } catch (e) {}
   }
-
-  if (!baseUrl) {
-    // Last resort: try process.env (may be stale but better than nothing)
-    let envPort = process.env.LETTA_BASE_URL || "";
-    if (envPort && envPort !== "unset") baseUrl = envPort;
-    else baseUrl = "http://localhost:8283";
-  }
+  if (!baseUrl) { let envPort = process.env.LETTA_BASE_URL || ""; if (envPort && envPort !== "unset") baseUrl = envPort; else baseUrl = "http://localhost:8283"; }
 
   return { baseUrl, apiKey, agentId, convId };
 }
 
-// ─── Message fetching ────────────────────────────────────────────
-
-async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean } | null> {
-  const { baseUrl, apiKey, agentId, convId } = getApiConfig();
-  if (!agentId || !convId) return null;
-
+/** Check if the conversation has an active run by looking at recent messages.
+ *  If the last message is an approval_request or tool_call without a matching
+ *  return/response, the conversation is busy. */
+async function isConversationBusy(baseUrl: string, apiKey: string | undefined, convId: string): Promise<boolean> {
   try {
-    const fullUrl = baseUrl + "/v1/agents/" + agentId + "/messages?conversation_id=" + convId + "&limit=50";
-    log("Fetching: " + fullUrl);
-    const resp = await fetch(fullUrl,
+    const { agentId } = getApiConfig();
+    if (!agentId) return false;
+    const resp = await fetch(
+      baseUrl + "/v1/agents/" + agentId + "/messages?conversation_id=" + convId + "&limit=3",
       { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} }
     );
-    if (!resp.ok) {
-      log("fetchLatestAgentMessage: API " + resp.status);
-      return null;
-    }
-
+    if (!resp.ok) return false;
     const data: any = await resp.json();
     const messages = Array.isArray(data) ? data : (data.messages || []);
-    if (!messages.length) return null;
+    if (!messages.length) return false;
 
-    messages.sort((a: any, b: any) =>
-      new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime()
-    );
+    // Check the most recent message type
+    const latest = messages[0];
+    const latestType = latest.message_type || "";
 
-    let assistantMsg: { id: string; text: string } | null = null;
-    let userContext = "(no context)";
+    // If the latest message is an approval_request, tool_call, or assistant_message
+    // without a following tool_return, the conversation is likely busy
+    if (latestType === "approval_request_message") return true;
 
-    for (const m of messages) {
-      const mt = m.message_type || "";
-      if (!assistantMsg && mt === "assistant_message") {
-        const c = m.content;
-        const text = typeof c === "string" ? c
-          : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ")
-          : "";
-        if (text.trim()) assistantMsg = { id: m.id || "", text };
-      }
-      if (userContext === "(no context)" && mt === "user_message") {
-        const c = m.content;
-        let text = typeof c === "string" ? c
-          : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ")
-          : "";
-        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
-        if (text) userContext = text.slice(0, 200);
-      }
-      if (assistantMsg && userContext !== "(no context)") break;
-    }
-
-    return assistantMsg ? {
-      ...assistantMsg,
-      userContext,
-      isDeliveryResponse: userContext.includes("[Oath Keeper]")
-    } : null;
+    // Check if there's a pending run by looking at run_ids
+    // If the latest message has a run_id different from older messages,
+    // and there's no completion signal, the run might still be active
+    return false;
   } catch (e) {
-    log("fetchLatestAgentMessage error: " + e);
-    return null;
+    return false;
   }
 }
 
-// ─── Delivery ────────────────────────────────────────────────────
-
-/**
- * tryDeliverOath — single delivery attempt. Returns "busy" on 409 (no retry).
- * The poll cycle will naturally retry on the next cycle (every 15s).
- */
+/** Try to deliver an oath. Returns "busy" on 409 or empty response. */
 async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fail"; answer: string }> {
   const { baseUrl, apiKey, convId } = getApiConfig();
-  const targetConv = (oath.conversationId && oath.conversationId !== "default")
-    ? oath.conversationId : convId;
+  const targetConv = (oath.conversationId && oath.conversationId !== "default") ? oath.conversationId : convId;
+  if (!targetConv || targetConv === "default") return { status: "fail", answer: "No conversation ID" };
 
-  if (!targetConv || targetConv === "default") {
-    return { status: "fail", answer: "No conversation ID" };
+  // Check if conversation is busy before attempting delivery
+  if (await isConversationBusy(baseUrl, apiKey, targetConv)) {
+    log("Oath " + oath.id + " delivery deferred — conversation has pending approval");
+    return { status: "busy", answer: "Conversation busy (pending approval)" };
   }
 
   const prompt = buildDeliveryPrompt(oath);
@@ -388,50 +385,22 @@ async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fa
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 45_000);
-
-    const resp = await fetch(
-      baseUrl + "/v1/conversations/" + targetConv + "/messages",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(apiKey ? { Authorization: "Bearer " + apiKey } : {}),
-        },
-        body: JSON.stringify({ input: prompt, role: "user" }),
-        signal: controller.signal,
-      }
-    );
+    const resp = await fetch(baseUrl + "/v1/conversations/" + targetConv + "/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: "Bearer " + apiKey } : {}) },
+      body: JSON.stringify({ input: prompt, role: "user" }),
+      signal: controller.signal,
+    });
     clearTimeout(timeout);
 
-    if (resp.status === 409) {
-      // Conversation is busy — don't retry, just report busy
-      log("Delivery deferred for " + oath.id + " (409 — conversation busy)");
-      return { status: "busy", answer: "Conversation busy" };
-    }
+    if (resp.status === 409 || resp.status === 429) { log("Delivery deferred (409/429)"); return { status: "busy", answer: "Conversation busy" }; }
+    if (!resp.ok) { log("Delivery HTTP " + resp.status); return { status: "fail", answer: "HTTP " + resp.status }; }
 
-    if (resp.status === 429) {
-      log("Delivery rate limited for " + oath.id + " (429)");
-      return { status: "busy", answer: "Rate limited" };
-    }
-
-    if (!resp.ok) {
-      log("Delivery failed for " + oath.id + " (HTTP " + resp.status + ")");
-      return { status: "fail", answer: "HTTP " + resp.status };
-    }
-
-    // Read SSE stream incrementally — return on first assistant message
+    // Read SSE stream incrementally
     const reader = resp.body?.getReader();
-    let answer = "";
-    let buffer = "";
-    let done = false;
-
+    let answer = "", buffer = "", done = false;
     if (reader) {
-      const readTimeout = setTimeout(() => {
-        done = true;
-        reader.cancel().catch(() => {});
-        log("Stream read timeout (30s) for oath " + oath.id);
-      }, 30_000);
-
+      const readTimeout = setTimeout(() => { done = true; reader.cancel().catch(() => {}); }, 30_000);
       while (!done) {
         const { done: streamDone, value } = await reader.read();
         if (streamDone) break;
@@ -442,41 +411,28 @@ async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fa
           if (!line.startsWith("data: ")) continue;
           const data = line.slice(6);
           if (data === "[DONE]") { done = true; break; }
-          try {
-            const d = JSON.parse(data);
-            if (d.message_type === "assistant_message" && d.content) {
-              answer = String(d.content).slice(0, 2000);
-              done = true;
-              log("Got assistant_message from stream for oath " + oath.id);
-              break;
-            }
-          } catch (e) {}
+          try { const d = JSON.parse(data); if (d.message_type === "assistant_message" && d.content) { answer = String(d.content).slice(0, 2000); done = true; break; } } catch (e) {}
         }
       }
       clearTimeout(readTimeout);
       reader.cancel().catch(() => {});
-    } else {
-      const text = await resp.text();
-      for (const line of text.split("\n")) {
-        if (!line.startsWith("data: ")) continue;
-        try {
-          const d = JSON.parse(line.slice(6));
-          if (d.message_type === "assistant_message" && d.content) {
-            answer = String(d.content).slice(0, 2000);
-          }
-        } catch (e) {}
-      }
     }
-
+    // If no assistant_message was captured, the conversation was busy.
+    // The POST was accepted (200) but the agent hasn't responded yet.
+    // Treat as "busy" so the oath retries on the next poll cycle.
+    if (answer.length === 0) {
+      log("Oath " + oath.id + " POST accepted but no response (conversation busy) — retrying");
+      return { status: "busy", answer: "No response in stream" };
+    }
     log("Oath " + oath.id + " delivered, answer length: " + answer.length);
-    return { status: "ok", answer: answer || "(delivered)" };
+    return { status: "ok", answer };
   } catch (e) {
     log("Delivery error for " + oath.id + ": " + e);
     return { status: "fail", answer: "Error: " + e };
   }
 }
 
-// ─── Polling fallback ────────────────────────────────────────────
+// ─── Polling ─────────────────────────────────────────────────────
 
 let intervalHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -485,108 +441,183 @@ async function pollCycle() {
   const now = Date.now();
 
   try {
-    // Mark poll version for debugging
-    if (store.pollVer !== "v2-builder") {
-      store.setPollVer("v2-builder");
-      store.save();
+    if (store.pollVer !== "v4-api") { store.setPollVer("v4-api"); store.save(); }
+
+    // 1. Check if any queued/delivering oaths have already been delivered
+    // by looking for [Oath Keeper] prompts in the conversation history
+    const { convId: checkConvId } = getApiConfig();
+    if (checkConvId) {
+      const checkStore = StateStore.load("delivery-check");
+      let checkChanged = false;
+      try {
+        const { baseUrl, apiKey, agentId } = getApiConfig();
+        const resp = await fetch(
+          baseUrl + "/v1/agents/" + agentId + "/messages?conversation_id=" + checkConvId + "&limit=10",
+          { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} }
+        );
+        if (resp.ok) {
+          const data: any = await resp.json();
+          const msgs = Array.isArray(data) ? data : (data.messages || []);
+          // Build set of recent message texts
+          let recentText = "";
+          for (const m of msgs) {
+            const mt = m.message_type || "";
+            if (mt === "user_message") {
+              const parts = m.content;
+              const text = typeof parts === "string" ? parts
+                : Array.isArray(parts) ? parts.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+              recentText += " " + text;
+            } else if (mt === "assistant_message") {
+              const c = m.content;
+              const text = typeof c === "string" ? c : "";
+              recentText += " " + text;
+            }
+          }
+
+          // Check each queued/delivering oath — if its delivery prompt is in history, mark delivered
+          for (const oath of checkStore.oaths) {
+            if (oath.status === "queued" || oath.status === "delivering") {
+              // Look for the [Oath Keeper] prompt with this promise text
+              const promptSnippet = oath.promise.slice(0, 40);
+              if (recentText.includes("[Oath Keeper]") && recentText.includes(promptSnippet)) {
+                // Also check for [Oath Delivered] response
+                if (recentText.includes("[Oath Delivered]")) {
+                  checkStore.updateOath(oath.id, { status: "delivered", result: "Confirmed via conversation history", deliveredAt: Date.now() });
+                  checkChanged = true;
+                  log("Oath " + oath.id + " confirmed delivered (found in conversation history)");
+                } else {
+                  // Prompt is there but no response yet — still processing
+                  checkStore.updateOath(oath.id, { status: "delivering" });
+                  checkChanged = true;
+                  log("Oath " + oath.id + " delivery prompt found in history (waiting for response)");
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        log("Delivery check error: " + e);
+      }
+      if (checkChanged) checkStore.save();
     }
 
-    // 1. Transition due oaths to "queued" (non-blocking — just mark them ready)
-    for (const oath of store.oaths) {
+    // 2. Transition due oaths to queued (ALL oaths — polling delivers via API POST)
+    // Reload state — delivery-check may have already updated some oaths
+    const queueStore = StateStore.load("queue-transition");
+    for (const oath of queueStore.oaths) {
       if (oath.status === "pending" && oath.dueAt <= now) {
-        store.updateOath(oath.id, { status: "queued" });
-        log("Oath " + oath.id + " timer expired → queued");
+        queueStore.updateOath(oath.id, { status: "queued" });
+        log("Oath " + oath.id + " → queued");
       }
     }
-    store.save();
+    queueStore.save();
 
-    // 2. Try to deliver queued oaths (one at a time, no retry loop)
-    const onDeck = store.oaths.find((o) => o.status === "queued");
-    if (onDeck) {
-      // Mark as "delivering" IMMEDIATELY and save — prevents next poll cycle
-      // from also trying to deliver the same oath (race condition fix)
-      store.updateOath(onDeck.id, { status: "delivering" });
+    // 3. Try to deliver one queued oath (only if not already delivered by history check)
+    const queuedOath = queueStore.oaths.find((o) => o.status === "queued");
+    if (queuedOath) {
+      store.updateOath(queuedOath.id, { status: "delivering" });
       store.save();
-      log("Oath " + onDeck.id + " queued → delivering (locked)");
+      log("Oath " + queuedOath.id + " queued → delivering (locked)");
 
-      // Now attempt the delivery
-      const result = await tryDeliverOath(onDeck);
-
-      // Reload state fresh, update with result, SAVE
+      const result = await tryDeliverOath(queuedOath);
       const updateStore = StateStore.load("delivery-result");
-      if (result.status === "busy") {
-        // Conversation is busy — go back to queued, try next cycle
-        updateStore.updateOath(onDeck.id, { status: "queued" });
+      // CRITICAL: Check if the oath was already marked delivered by the 
+      // delivery-check section (conversation history check). If so, 
+      // do NOT overwrite with queued/busy.
+      const currentOath = updateStore.findOath(queuedOath.id);
+      if (currentOath && currentOath.status === "delivered") {
+        log("Oath " + queuedOath.id + " already delivered (history check) — skipping result update");
+      } else if (result.status === "busy") {
+        updateStore.updateOath(queuedOath.id, { status: "queued" });
         updateStore.save();
-        log("Oath " + onDeck.id + " delivery deferred (conversation busy) — back to queued");
+        log("Oath " + queuedOath.id + " back to queued (busy)");
       } else if (result.status === "ok") {
-        updateStore.updateOath(onDeck.id, {
-          status: "delivered",
-          result: result.answer?.slice(0, 500) || null,
-          deliveredAt: Date.now(),
-        });
+        updateStore.updateOath(queuedOath.id, { status: "delivered", result: result.answer.slice(0, 500), deliveredAt: Date.now() });
         updateStore.save();
-        log("Oath " + onDeck.id + " delivered successfully");
+        log("Oath " + queuedOath.id + " delivered");
       } else {
-        updateStore.updateOath(onDeck.id, {
-          status: "failed",
-          result: result.answer?.slice(0, 500) || null,
-          deliveredAt: Date.now(),
-        });
+        updateStore.updateOath(queuedOath.id, { status: "failed", result: result.answer.slice(0, 500), deliveredAt: Date.now() });
         updateStore.save();
-        log("Oath " + onDeck.id + " delivery failed: " + result.answer);
+        log("Oath " + queuedOath.id + " failed: " + result.answer);
       }
     }
 
-    // Handle stuck "delivering" oaths — if delivering for more than 5 minutes, reset to queued
-    // RELOAD from disk first — the delivery block above may have already updated the state
-    const postDeliveryStore = StateStore.load("post-delivery-check");
+    // 3. Reset stuck delivering oaths (>5 min)
+    const resetStore = StateStore.load("stuck-check");
     const fiveMinAgo = now - 300_000;
-    for (const oath of postDeliveryStore.oaths) {
+    for (const oath of resetStore.oaths) {
       if (oath.status === "delivering" && oath.dueAt < fiveMinAgo) {
-        postDeliveryStore.updateOath(oath.id, { status: "queued" });
+        resetStore.updateOath(oath.id, { status: "queued" });
+        log("Oath " + oath.id + " stuck → queued");
       }
     }
-    postDeliveryStore.prune(now);
-    postDeliveryStore.save();
+    resetStore.prune(now);
+    resetStore.save();
 
-    // 2. Scan for new promises — ALWAYS reload fresh state here
-    // (the delivery block above may have changed state on disk)
+    // 4. Scan for new promises
     const scanStore = StateStore.load("scan-phase");
-    if (scanStore.hasActiveOaths()) {
-      log("Skipping scan — active oaths exist");
-      return;
-    }
+    if (scanStore.hasActiveOaths()) { log("Skipping scan — active oaths"); return; }
 
-    const { convId } = getApiConfig();
+    const { convId, agentId } = getApiConfig();
     const latest = await fetchLatestAgentMessage();
-
     if (latest && scanStore.lastScannedMessageId !== latest.id) {
       scanStore.setScanned(latest.id);
       scanStore.save();
-
-      // Skip delivery responses
-      if (latest.isDeliveryResponse) {
-        log("Skipping detection — response to Oath Keeper delivery");
-        return;
-      }
-
-      const detection = detectPromiseRegex(latest.text);
-      if (detection) {
-        const exists = scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
-        if (!exists) {
-          const { agentId } = getApiConfig();
-          const oath = createOath(detection.promise, latest.userContext, convId, agentId, latest.id);
-          scanStore.addOath(oath);
-          scanStore.save();
+      if (latest.isDeliveryResponse) { log("Skipping — delivery response"); return; }
+      const preFilter = detectPromiseRegex(latest.text);
+      if (preFilter) {
+        log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
+        const confirmed = await confirmPromise(latest.text);
+        if (!confirmed) {
+          logFalsePositive(preFilter.match, latest.text, "polling");
+        }
+        if (confirmed) {
+          const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
+                                scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
+          if (!alreadyExists) {
+            const oath = createOath(confirmed.promise, latest.userContext, convId, agentId, latest.id, "polling");
+            scanStore.addOath(oath);
+            scanStore.save();
+          }
         }
       }
-    } else if (!latest) {
-      log("No latest message found");
     }
   } catch (e) {
     log("Poll error: " + e);
   }
+}
+
+// ─── Message fetching ────────────────────────────────────────────
+
+async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean } | null> {
+  const { baseUrl, apiKey, agentId, convId } = getApiConfig();
+  if (!agentId || !convId) return null;
+  try {
+    const resp = await fetch(baseUrl + "/v1/agents/" + agentId + "/messages?conversation_id=" + convId + "&limit=50", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+    if (!resp.ok) return null;
+    const data: any = await resp.json();
+    const messages = Array.isArray(data) ? data : (data.messages || []);
+    if (!messages.length) return null;
+    messages.sort((a: any, b: any) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
+    let assistantMsg: { id: string; text: string } | null = null;
+    let userContext = "(no context)";
+    for (const m of messages) {
+      const mt = m.message_type || "";
+      if (!assistantMsg && mt === "assistant_message") {
+        const c = m.content;
+        const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+        if (text.trim()) assistantMsg = { id: m.id || "", text };
+      }
+      if (userContext === "(no context)" && mt === "user_message") {
+        const c = m.content;
+        let text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+        if (text) userContext = text.slice(0, 200);
+      }
+      if (assistantMsg && userContext !== "(no context)") break;
+    }
+    return assistantMsg ? { ...assistantMsg, userContext, isDeliveryResponse: userContext.includes("[Oath Keeper]") } : null;
+  } catch (e) { return null; }
 }
 
 // ─── Mod Activation ──────────────────────────────────────────────
@@ -598,28 +629,44 @@ export default function activate(letta: any) {
   log("hasTurnEvents: " + hasTurnEvents);
   try { letta.diagnostics.report({ message: "Capabilities: " + JSON.stringify(letta.capabilities) + " hasTurnEvents: " + hasTurnEvents, severity: "warning" }); } catch (e) {}
 
-  if (!letta.capabilities.tools) {
-    log("No tools capability — mod inactive");
-    return () => {};
-  }
+  if (!letta.capabilities.tools) { log("No tools — inactive"); return () => {}; }
 
-  // ── Mode 1: turn_end events ──────────────────────────────────
+  // ── turn_end (CLI) ──────────────────────────────────────────
   if (hasTurnEvents) {
     disposers.push(
-      letta.events.on("turn_end", async (event: any, _ctx: any) => {
-        log("turn_end FIRED — assistantMessage length: " + (event.assistantMessage || "").length);
+      letta.events.on("turn_end", async (event: any, ctx: any) => {
         const assistantMessage = event.assistantMessage || "";
+        log("turn_end FIRED — length: " + assistantMessage.length);
 
-        if (assistantMessage.includes("[Oath Keeper]") || assistantMessage.includes("[Oath Delivered]")) {
-          if (assistantMessage.includes("[Oath Delivered]")) {
-            const store = StateStore.load("turn_end-delivery-mark");
+        // Build full turn text from history (assistantMessage only has last block)
+        let fullTurnText = assistantMessage;
+        try {
+          const history = await ctx.conversation.getHistory({ limit: 20 });
+          if (history && history.length > 0) {
+            const assistantTexts: string[] = [];
+            for (const msg of history) {
+              const role = msg.role || msg.message_type || "";
+              if (role === "user" || role === "user_message") break;
+              if (role === "assistant" || role === "assistant_message") {
+                const content = msg.content;
+                let text = "";
+                if (typeof content === "string") text = content;
+                else if (Array.isArray(content)) text = content.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ");
+                if (text.trim() && !text.includes("[Oath Delivered]") && !text.includes("[Oath Keeper]")) assistantTexts.push(text);
+              }
+            }
+            if (assistantMessage.trim() && !assistantTexts.includes(assistantMessage)) assistantTexts.unshift(assistantMessage);
+            if (assistantTexts.length > 0) fullTurnText = assistantTexts.join(" ");
+          }
+        } catch (e) { log("turn_end getHistory error: " + e); }
+
+        // Recursion prevention
+        if (fullTurnText.includes("[Oath Keeper]") || fullTurnText.includes("[Oath Delivered]")) {
+          if (fullTurnText.includes("[Oath Delivered]")) {
+            const store = StateStore.load("turn_end-mark");
             for (const oath of store.oaths) {
-              if (oath.status === "delivering") {
-                store.updateOath(oath.id, {
-                  status: "delivered",
-                  result: assistantMessage.slice(0, 500),
-                  deliveredAt: Date.now(),
-                });
+              if (oath.status === "delivering" || oath.status === "queued") {
+                store.updateOath(oath.id, { status: "delivered", result: fullTurnText.slice(0, 500), deliveredAt: Date.now() });
               }
             }
             store.save();
@@ -629,42 +676,52 @@ export default function activate(letta: any) {
 
         const now = Date.now();
         const store = StateStore.load("turn_end-detect");
+        const preFilter = detectPromiseRegex(fullTurnText);
+        log("turn_end pre-filter: " + (preFilter ? "MATCH: " + preFilter.match : "none"));
 
-        const detection = detectPromiseRegex(assistantMessage);
-        if (detection) {
-          const exists = store.oaths.some(
-            (o) => o.promise === detection.promise && o.status === "pending"
-          );
-          if (!exists) {
-            const oath = createOath(
-              detection.promise, "(from turn_end event)",
-              event.conversationId || "", event.agentId || ""
-            );
-            store.addOath(oath);
-            store.save();
+        if (preFilter) {
+          log("turn_end: confirming with LLM...");
+          const detection = await confirmPromise(fullTurnText);
+          log("turn_end LLM: " + (detection ? "CONFIRMED: " + detection.promise.slice(0, 60) : "REJECTED"));
+          if (!detection) {
+            logFalsePositive(preFilter.match, fullTurnText, "turn_end");
+          }
+          if (detection) {
+            const alreadyExists = store.hasRecentPromise(detection.promise);
+            if (!alreadyExists) {
+              const convId = event.conversationId || ctx?.conversation?.id || "";
+              const agentId = event.agentId || ctx?.agent?.id || "";
+              const oath = createOath(detection.promise, assistantMessage.slice(0, 200) || "(from turn_end)", convId, agentId, undefined, "turn_end");
+              store.addOath(oath);
+              store.save();
+              log("turn_end: oath created — " + oath.id);
+            }
           }
         }
 
-        const dueOath = store.oaths.find((o) => o.status === "pending" && o.dueAt <= now);
+        // Deliver due oaths via { continue: prompt } — ONLY if polling hasn't already handled it
+        // Skip oaths that are queued/delivering/delivered (polling is handling those)
+        const dueOath = store.oaths.find(
+          (o) => o.status === "pending" && o.dueAt <= now && o.deliveryMode === "turn_end"
+        );
         if (dueOath) {
           store.updateOath(dueOath.id, { status: "delivering" });
           store.save();
+          log("turn_end: delivering via continue");
           return { continue: buildDeliveryPrompt(dueOath) };
         }
       })
     );
-    log("turn_end handler registered (event mode)");
+    log("turn_end handler registered");
   }
 
-  // ── Mode 2: setInterval polling ──────────────────────────────
-  if (!hasTurnEvents) {
-    if (intervalHandle) clearInterval(intervalHandle);
-    intervalHandle = setInterval(pollCycle, POLL_INTERVAL_MS);
-    pollCycle();
-    log("Polling started (fallback mode)");
-  }
+  // ── Polling — always enabled alongside turn_end (with strong dedup)
+  if (intervalHandle) clearInterval(intervalHandle);
+  intervalHandle = setInterval(pollCycle, POLL_INTERVAL_MS);
+  pollCycle();
+  log("Polling started (alongside turn_end, dedup active)");
 
-  // ── list_oaths tool ──────────────────────────────────────────
+  // ── list_oaths tool ─────────────────────────────────────────
   disposers.push(
     letta.tools.register({
       name: "list_oaths",
@@ -672,39 +729,27 @@ export default function activate(letta: any) {
       parameters: { type: "object", properties: {}, additionalProperties: false },
       requiresApproval: false,
       parallelSafe: true,
-
       async run() {
         const store = StateStore.load("list_oaths");
-        const pending = store.oaths.filter((o) => o.status === "pending");
-        const recent = store.oaths.filter(
-          (o) =>
-            (o.status === "delivered" || o.status === "failed") &&
-            o.deliveredAt && Date.now() - o.deliveredAt < 3_600_000
-        );
-
-        if (pending.length === 0 && recent.length === 0) {
-          return "No oaths. Agents have kept their word.";
-        }
-
-        const mode = hasTurnEvents ? "events" : "polling";
-        const lines = [`Oath Keeper (${mode}) — ${pending.length} pending, ${recent.length} recent`];
-        for (const o of pending) {
+        const pending = store.oaths.filter((o) => o.status === "pending" || o.status === "queued");
+        const delivering = store.oaths.filter((o) => o.status === "delivering");
+        const recent = store.oaths.filter((o) => (o.status === "delivered" || o.status === "failed") && o.deliveredAt && Date.now() - o.deliveredAt < 3_600_000);
+        if (pending.length === 0 && delivering.length === 0 && recent.length === 0) return "No oaths. Agents have kept their word.";
+        const lines = [`Oath Keeper — ${pending.length} pending, ${delivering.length} delivering, ${recent.length} recent`];
+        for (const o of [...pending, ...delivering]) {
           const secs = Math.max(0, Math.round((o.dueAt - Date.now()) / 1000));
-          lines.push(`PENDING (${secs}s): "${o.promise.slice(0, 80)}"`);
+          lines.push(`${o.status.toUpperCase()} (${secs}s): "${o.promise.slice(0, 80)}"`);
         }
-        for (const o of recent) {
-          lines.push(`${o.status === "delivered" ? "OK" : "FAIL"}: "${o.promise.slice(0, 80)}"`);
-        }
+        for (const o of recent) lines.push(`${o.status === "delivered" ? "OK" : "FAIL"}: "${o.promise.slice(0, 80)}"`);
         return lines.join("\n");
       },
     })
   );
 
-  log("list_oaths tool registered");
+  log("list_oaths registered");
 
   return () => {
-    for (const d of disposers.reverse()) {
-      try { d(); } catch (e) {}
+    for (const d of disposers.reverse()) { try { d(); } catch (e) {}
     }
     if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
   };
