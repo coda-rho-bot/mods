@@ -25,9 +25,23 @@ const FALSE_POSITIVE_FILE = `${HOME}/.letta/mods/oath-keeper-false-positives.jso
 const POLL_INTERVAL_MS = 15_000;
 const DELAY_MS = 60_000;
 
+// Only log to console for important events (not every poll cycle)
+const IMPORTANT_PATTERNS = [
+  "oath created", "delivered", "failed", "delivering", "confirmed",
+  "rejected", "pre-filter matched", "turn_end FIRED", "scheduled cron",
+  "error", "ERROR", "stuck", "false positive", "Polling started",
+  "turn_end handler registered", "list_oaths registered",
+];
+
+function isImportant(msg: string): boolean {
+  return IMPORTANT_PATTERNS.some((p) => msg.toLowerCase().includes(p.toLowerCase()));
+}
+
 function log(msg: string) {
-  console.log("[oath-keeper] " + msg);
   addDebugLog(msg);
+  if (isImportant(msg)) {
+    console.log("[oath-keeper] " + msg);
+  }
 }
 
 // ─── Debug log ───────────────────────────────────────────────────
@@ -298,9 +312,21 @@ async function confirmPromise(text: string): Promise<{ promise: string } | null>
 // ─── Helpers ─────────────────────────────────────────────────────
 
 function buildDeliveryPrompt(oath: Oath): string {
+  // Include current context so the agent doesn't need to look anything up.
+  // Server-side tools (web_search) work during delivery but return stale data.
+  // Client-side tools (Bash) require approval that times out during delivery turns.
+  // Pre-compute common answers to avoid tool calls entirely.
+  let context = '';
+  try {
+    const now = new Date();
+    const timeStr = now.toLocaleString("en-US", { timeZone: "America/Chicago" });
+    context = '\n\nCurrent time: ' + timeStr + ' CDT';
+  } catch (e) {}
+
   return '[Oath Keeper] You previously promised the user:\n"' + oath.promise +
-    '"\n\nDeliver on your promise now. Answer directly. If you need to check something, use Bash — not web_search. ' +
-    'Keep it to 1-3 sentences. Start your response with "[Oath Delivered]".';
+    '"\n\nDeliver on your promise now. Do NOT use any tools — answer directly from the context provided.' +
+    context +
+    '\n\nKeep it to 1-3 sentences. Start your response with "[Oath Delivered]".';
 }
 
 function createOath(promise: string, context: string, conversationId: string, agentId: string, sourceMessageId?: string, deliveryMode?: "turn_end" | "polling"): Oath {
@@ -325,12 +351,24 @@ function getApiConfig() {
     convId = env.LETTA_CONVERSATION_ID || "";
   } catch (e) {}
 
-  // Dynamic port discovery if env file is stale
-  if (!baseUrl) {
-    try { const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\.0\\.0\\.1:\\K\\d+'", { encoding: "utf8", timeout: 2000 }).trim(); if (output) baseUrl = "http://localhost:" + output; } catch (e) {}
-  }
-  if (!baseUrl) { let envPort = process.env.LETTA_BASE_URL || ""; if (envPort && envPort !== "unset") baseUrl = envPort; else baseUrl = "http://localhost:8283"; }
+  // Dynamic port discovery — ALWAYS discover the actual port from the running process.
+  // The env file port goes stale on every app restart. ss finds the real port.
+  let discoveredPort = "";
+  try {
+    const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\.0\\.0\\.1:\\K\\d+'", { encoding: "utf8", timeout: 2000 }).trim();
+    if (output) discoveredPort = output;
+  } catch (e) {}
 
+  // Use discovered port if available, otherwise fall back to env file, then default
+  if (discoveredPort) {
+    baseUrl = "http://localhost:" + discoveredPort;
+  } else if (!baseUrl) {
+    let envPort = process.env.LETTA_BASE_URL || "";
+    if (envPort && envPort !== "unset") baseUrl = envPort;
+    else baseUrl = "http://localhost:8283";
+  }
+
+  addDebugLog("getApiConfig: baseUrl=" + baseUrl + " agentId=" + (agentId ? agentId.slice(0,12) : "NONE") + " convId=" + (convId ? convId.slice(0,12) : "NONE"));
   return { baseUrl, apiKey, agentId, convId };
 }
 
@@ -617,7 +655,7 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
       if (assistantMsg && userContext !== "(no context)") break;
     }
     return assistantMsg ? { ...assistantMsg, userContext, isDeliveryResponse: userContext.includes("[Oath Keeper]") } : null;
-  } catch (e) { return null; }
+  } catch (e) { log("fetchLatestAgentMessage error: " + e); return null; }
 }
 
 // ─── Mod Activation ──────────────────────────────────────────────
@@ -631,8 +669,10 @@ export default function activate(letta: any) {
 
   if (!letta.capabilities.tools) { log("No tools — inactive"); return () => {}; }
 
-  // ── turn_end (CLI) ──────────────────────────────────────────
-  if (hasTurnEvents) {
+  // ── turn_end (CLI) ── DISABLED — polling handles detection
+  // turn_end getHistory() is unreliable and causes detection issues
+  // if (hasTurnEvents) {
+  if (false) {
     disposers.push(
       letta.events.on("turn_end", async (event: any, ctx: any) => {
         const assistantMessage = event.assistantMessage || "";
