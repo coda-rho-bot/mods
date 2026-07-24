@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
 
 import activate, { __test } from "./mods/index.mjs";
 
+const execFileAsync = promisify(execFile);
 const originalEnv = { ...process.env };
 
 test.afterEach(() => {
@@ -91,7 +94,7 @@ test("QMD lookup uses PATH directly and prepends with the platform delimiter", a
   await rm(root, { recursive: true, force: true });
 });
 
-test("Windows lookup prefers PowerShell shims and never builds a shell string", () => {
+test("Windows lookup prefers PowerShell shims and keeps command-shim args out of code", async () => {
   const names = __test.executableNames("qmd", "win32", {
     PATHEXT: ".COM;.EXE;.BAT;.CMD",
   });
@@ -103,10 +106,27 @@ test("Windows lookup prefers PowerShell shims and never builds a shell string", 
   assert.equal(ps1.executable, "powershell.exe");
   assert.deepEqual(ps1.args.slice(-3), ["C:\\bin\\qmd.ps1", "query", "a&b"]);
 
+  const root = await mkdtemp(path.join(tmpdir(), "memfs-search-powershell-"));
+  const fakePowerShell = path.join(root, "powershell.exe");
+  await writeFile(
+    fakePowerShell,
+    `#!${process.execPath}\nprocess.stdout.write(JSON.stringify({ argv: process.argv.slice(2), path: process.env.LETTA_QMD_SHIM_PATH, args: JSON.parse(process.env.LETTA_QMD_SHIM_ARGS) }));\n`,
+  );
+  await chmod(fakePowerShell, 0o755);
+
   const cmd = __test.commandInvocation("C:\\bin\\qmd.cmd", ["query", "a&b"], {
     platform: "win32",
+    powerShellExecutable: fakePowerShell,
   });
-  assert.equal(cmd.executable, "powershell.exe");
-  assert.equal(cmd.args.at(-1), "a&b");
-  assert.match(cmd.args[cmd.args.indexOf("-Command") + 1], /\$args/);
+  const { stdout } = await execFileAsync(cmd.executable, cmd.args, {
+    env: { ...process.env, ...cmd.env },
+  });
+  const child = JSON.parse(stdout);
+
+  assert.equal(child.path, "C:\\bin\\qmd.cmd");
+  assert.deepEqual(child.args, ["query", "a&b"]);
+  assert.equal(child.argv.at(-1), cmd.args.at(-1));
+  assert.ok(!child.argv.includes("C:\\bin\\qmd.cmd"));
+  assert.ok(!child.argv.includes("a&b"));
+  await rm(root, { recursive: true, force: true });
 });

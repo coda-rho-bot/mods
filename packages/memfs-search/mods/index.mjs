@@ -117,10 +117,11 @@ async function commandExists(command) {
 
 function commandInvocation(executable, args, options = {}) {
   const platform = options.platform ?? process.platform;
+  const powerShellExecutable = options.powerShellExecutable ?? "powershell.exe";
   const extension = path.extname(executable).toLowerCase();
   if (platform === "win32" && extension === ".ps1") {
     return {
-      executable: "powershell.exe",
+      executable: powerShellExecutable,
       args: [
         "-NoLogo",
         "-NoProfile",
@@ -135,9 +136,10 @@ function commandInvocation(executable, args, options = {}) {
   }
   if (platform === "win32" && (extension === ".cmd" || extension === ".bat")) {
     return {
-      executable: "powershell.exe",
-      // Keep caller-provided args in PowerShell's $args array instead of
-      // interpolating them into a cmd.exe command string.
+      executable: powerShellExecutable,
+      // powershell.exe joins every argument after -Command into executable code.
+      // Carry the shim path and its arguments through the environment so queries
+      // remain data rather than becoming part of that command string.
       args: [
         "-NoLogo",
         "-NoProfile",
@@ -145,10 +147,12 @@ function commandInvocation(executable, args, options = {}) {
         "-ExecutionPolicy",
         "Bypass",
         "-Command",
-        "& $args[0] @($args | Select-Object -Skip 1)",
-        executable,
-        ...args,
+        "$qmdArgs = @(ConvertFrom-Json -InputObject $env:LETTA_QMD_SHIM_ARGS); & $env:LETTA_QMD_SHIM_PATH @qmdArgs",
       ],
+      env: {
+        LETTA_QMD_SHIM_PATH: executable,
+        LETTA_QMD_SHIM_ARGS: JSON.stringify(args),
+      },
     };
   }
   return { executable, args };
@@ -160,7 +164,10 @@ async function execQmd(args, options = {}) {
   const invocation = commandInvocation(executable, args);
   return await execFileAsync(invocation.executable, invocation.args, {
     ...options,
-    env: qmdEnv(path.dirname(executable)),
+    env: {
+      ...qmdEnv(path.dirname(executable)),
+      ...invocation.env,
+    },
   });
 }
 
