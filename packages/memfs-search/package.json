@@ -35,5 +35,8 @@
     "engines": {
       "lettaCodeCli": ">=0.27.14"
     }
+  },
+  "scripts": {
+    "test": "node --test test.mjs"
   }
 }
