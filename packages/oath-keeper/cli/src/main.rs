@@ -37,6 +37,7 @@ struct Oath {
     #[serde(default)] cron_id: Option<String>,
     #[serde(default, rename = "deliveryMode")] delivery_mode: Option<String>,
     #[serde(default, rename = "ngramScore")] ngram_score: Option<f64>,
+    #[serde(default, rename = "llmTokens")] llm_tokens: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -430,6 +431,14 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             } else {
                                 line2_spans.push(Span::styled("N/A  ", Style::default().fg(Color::DarkGray)));
                             }
+                            // Token usage
+                            if let Some(tokens) = &o.llm_tokens {
+                                let total = tokens.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                                line2_spans.push(Span::styled("tokens:", Style::default().fg(Color::Gray)));
+                                line2_spans.push(Span::styled(format!("{}  ", total), Style::default().fg(Color::Yellow)));
+                            } else {
+                                line2_spans.push(Span::styled("tokens:0  ", Style::default().fg(Color::DarkGray)));
+                            }
 
                             let line2 = Line::from(line2_spans);
 
@@ -517,6 +526,23 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                         spans.push(Span::styled(format!("{:.1}", score), Style::default().fg(Color::Yellow)));
                                     } else {
                                         spans.push(Span::styled("N/A", Style::default().fg(Color::DarkGray)));
+                                    }
+                                    spans
+                                }),
+                                Line::from({
+                                    let mut spans = vec![
+                                        Span::styled("Tokens:   ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                                    ];
+                                    if let Some(tokens) = &o.llm_tokens {
+                                        let prompt = tokens.get("prompt").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        let completion = tokens.get("completion").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        let total = tokens.get("total").and_then(|t| t.as_u64()).unwrap_or(0);
+                                        spans.push(Span::styled(
+                                            format!("{} (prompt: {}, completion: {})", total, prompt, completion),
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                    } else {
+                                        spans.push(Span::styled("0 (no LLM calls)", Style::default().fg(Color::DarkGray)));
                                     }
                                     spans
                                 }),

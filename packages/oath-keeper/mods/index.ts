@@ -136,6 +136,7 @@ interface Oath {
   result: string | null;
   deliveredAt: number | null;
   ngramScore?: number;
+  llmTokens?: { prompt: number; completion: number; total: number };
 }
 
 interface StateData {
@@ -220,7 +221,7 @@ class StateStore {
 }
 
 /** LLM dedup — checks if a new promise is semantically the same as any existing active oath */
-async function isDuplicatePromise(newPromise: string, existingOaths: Oath[]): Promise<boolean> {
+async function isDuplicatePromise(newPromise: string, existingOaths: Oath[]): Promise<{ isDup: boolean; tokens?: { prompt: number; completion: number; total: number } }> {
   if (existingOaths.length === 0) return false;
   const { baseUrl, apiKey } = getApiConfig();
   const classifierAgentId = getClassifierAgentId();
@@ -243,7 +244,7 @@ async function isDuplicatePromise(newPromise: string, existingOaths: Oath[]): Pr
       headers: { "Content-Type": "application/json", ...(apiKey ? { Authorization: "Bearer " + apiKey } : {}) },
       body: JSON.stringify({ model: classifierModel }),
     });
-    if (!convResp.ok) return false;
+    if (!convResp.ok) return { isDup: false };
     const convData: any = await convResp.json();
     const classConvId = convData.id || "";
 
@@ -267,29 +268,32 @@ async function isDuplicatePromise(newPromise: string, existingOaths: Oath[]): Pr
     if (!resp.ok) return false;
     const respText = await resp.text();
     let answer = "";
+    let tokenUsage: { prompt: number; completion: number; total: number } | undefined;
     for (const line of respText.split("\n")) {
       if (!line.startsWith("data: ")) continue;
       const data = line.slice(6);
       if (data === "[DONE]") break;
       try {
         const d = JSON.parse(data);
+        if (d.message_type === "usage_statistics") {
+          tokenUsage = { prompt: d.prompt_tokens || 0, completion: d.completion_tokens || 0, total: d.total_tokens || 0 };
+        }
         if (d.message_type === "assistant_message" && d.content) {
           answer = String(d.content).slice(0, 500);
-          break;
         }
       } catch (e) {}
     }
 
     const jsonMatch = answer.match(/\{[^}]*\}/);
-    if (!jsonMatch) return false;
+    if (!jsonMatch) return { isDup: false, tokens: tokenUsage };
     const parsed = JSON.parse(jsonMatch[0]);
     const isDup = parsed.is_duplicate === true;
     if (isDup) log("isDuplicatePromise: DUPLICATE of oath #" + parsed.matching_index);
     else log("isDuplicatePromise: not a duplicate");
-    return isDup;
+    return { isDup, tokens: tokenUsage };
   } catch (e) {
     log("isDuplicatePromise error: " + e);
-    return false;
+    return { isDup: false };
   }
 }
 
@@ -421,7 +425,7 @@ function logPreFilterRejection(text: string, reason: string, ngramScore?: number
  * ask the LLM to confirm whether it's a genuine promise to follow up later.
  * Returns the specific promise text or null if not a real promise.
  */
-async function confirmPromise(text: string): Promise<{ promise: string; delayMs: number } | null> {
+async function confirmPromise(text: string): Promise<{ promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null> {
   const { baseUrl, apiKey } = getApiConfig();
   const classifierAgentId = getClassifierAgentId();
   if (!classifierAgentId) return null;
@@ -488,15 +492,22 @@ async function confirmPromise(text: string): Promise<{ promise: string; delayMs:
 
     const respText = await resp.text();
     let answer = "";
+    let tokenUsage: { prompt: number; completion: number; total: number } | undefined;
     for (const line of respText.split("\n")) {
       if (!line.startsWith("data: ")) continue;
       const data = line.slice(6);
       if (data === "[DONE]") break;
       try {
         const d = JSON.parse(data);
+        if (d.message_type === "usage_statistics") {
+          tokenUsage = {
+            prompt: d.prompt_tokens || 0,
+            completion: d.completion_tokens || 0,
+            total: d.total_tokens || 0,
+          };
+        }
         if (d.message_type === "assistant_message" && d.content) {
           answer = String(d.content).slice(0, 2000);
-          break;
         }
       } catch (e) {}
     }
@@ -515,7 +526,7 @@ async function confirmPromise(text: string): Promise<{ promise: string; delayMs:
         delayMs = parsed.delay_seconds * 1000;
       }
       log("confirmPromise: CONFIRMED — " + parsed.promise.slice(0, 60) + " (delay: " + (delayMs / 1000) + "s)");
-      return { promise: parsed.promise.slice(0, 300), delayMs };
+      return { promise: parsed.promise.slice(0, 300), delayMs, tokens: tokenUsage };
     }
     log("confirmPromise: REJECTED — not a genuine promise");
     return null;
@@ -1015,14 +1026,26 @@ export default function activate(letta: any) {
         }
 
         // Stage 2: LLM confirmation (if enabled)
-        let detection: { promise: string; delayMs: number } | null = null;
+        let detection: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null = null;
+        let llmTokens: { prompt: number; completion: number; total: number } | undefined;
         if (isLlmConfirmEnabled()) {
           log("turn_end: sending to LLM...");
           detection = await confirmPromise(msgText);
           log("turn_end LLM: " + (detection ? "CONFIRMED: " + detection.promise.slice(0, 60) + " delay=" + (detection.delayMs/1000) + "s" : "REJECTED"));
 
+          if (detection?.tokens) llmTokens = detection.tokens;
+
           if (!detection) {
             logFalsePositive("llm", msgText, "turn_end", ngramScore, eventConvId, eventAgentId);
+            // Store tokens on the false positive entry
+            if (llmTokens) {
+              const fpStore = StateStore.load("turn_end-fp-tokens");
+              const fpEntry = fpStore.oaths[fpStore.oaths.length - 1];
+              if (fpEntry) {
+                fpStore.updateOath(fpEntry.id, { llmTokens });
+                fpStore.save();
+              }
+            }
             scanStore.save();
             return;
           }
@@ -1035,8 +1058,15 @@ export default function activate(letta: any) {
         // Stage 3: LLM semantic dedup (if enabled)
         if (isLlmDedupEnabled()) {
           const existing = scanStore.activeOaths();
-          const isDup = existing.length > 0 ? await isDuplicatePromise(detection.promise, existing) : false;
-          if (isDup) {
+          const dedupResult = existing.length > 0 ? await isDuplicatePromise(detection.promise, existing) : { isDup: false };
+          if (dedupResult.tokens) {
+            // Accumulate dedup tokens
+            if (!llmTokens) llmTokens = { prompt: 0, completion: 0, total: 0 };
+            llmTokens.prompt += dedupResult.tokens.prompt;
+            llmTokens.completion += dedupResult.tokens.completion;
+            llmTokens.total += dedupResult.tokens.total;
+          }
+          if (dedupResult.isDup) {
             log("turn_end: duplicate promise — skipping");
             return;
           }
@@ -1047,6 +1077,7 @@ export default function activate(letta: any) {
         if (!alreadyExists) {
           const oath = createOath(detection.promise, "(turn_end)", eventConvId, eventAgentId, undefined, "turn_end", detection.delayMs);
           oath.ngramScore = ngramScore;
+          oath.llmTokens = llmTokens;
           scanStore.addOath(oath);
           scanStore.save();
           log("turn_end: oath created — " + oath.id + " conv=" + eventConvId.slice(0,12) + " score=" + (ngramScore ?? "N/A") + " delay=" + (detection.delayMs/1000) + "s");
