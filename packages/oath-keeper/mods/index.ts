@@ -81,16 +81,16 @@ function getNgramThreshold(): number {
   return typeof config.ngramThreshold === "number" ? config.ngramThreshold : 1;
 }
 
-/** Check if LLM confirmation is enabled (default: true) */
+/** Check if LLM confirmation is enabled (default: false) */
 function isLlmConfirmEnabled(): boolean {
   const config = loadConfig();
-  return config.llmConfirm !== false; // default true
+  return config.llmConfirm === true; // default false
 }
 
-/** Check if LLM semantic dedup is enabled (default: true) */
+/** Check if LLM semantic dedup is enabled (default: false) */
 function isLlmDedupEnabled(): boolean {
   const config = loadConfig();
-  return config.llmDedup !== false; // default true
+  return config.llmDedup === true; // default false
 }
 
 /** Check if at least one filter is active — if not, no oaths are created */

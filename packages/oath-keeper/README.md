@@ -115,8 +115,8 @@ All configuration lives in `~/.letta/mods/oath-keeper.config.json`:
   "negativeFilter": true,
   "ngramFilter": true,
   "ngramThreshold": 1,
-  "llmConfirm": true,
-  "llmDedup": true
+  "llmConfirm": false,
+  "llmDedup": false
 }
 ```
 
@@ -137,8 +137,8 @@ All four detection stages can be individually toggled:
 | `negativeFilter` | `true` | Negative filter — skips short messages (<15 chars) and code-heavy messages (>5% syntax characters). |
 | `ngramFilter` | `true` | N-gram pre-filter. When disabled, all messages skip the pre-filter and go directly to LLM confirmation. |
 | `ngramThreshold` | `1` | Minimum n-gram score required to trigger LLM classification. Lower = more sensitive (more LLM calls). Higher = stricter (fewer calls, may miss promises). |
-| `llmConfirm` | `true` | LLM promise classification. When disabled, messages that pass the n-gram filter create oaths directly without LLM confirmation. |
-| `llmDedup` | `true` | LLM semantic dedup. When disabled, only string-based dedup is used. |
+| `llmConfirm` | `false` | LLM promise classification. When disabled (default), messages that pass the n-gram filter create oaths directly without LLM confirmation. Enable for fewer false positives. |
+| `llmDedup` | `false` | LLM semantic dedup. When disabled (default), only string-based dedup is used. Enable to catch paraphrased duplicates. |
 
 **Safety:** If both `ngramFilter` and `llmConfirm` are disabled, no oaths are created — the mod skips detection entirely. The TUI displays a red warning when this occurs.
 
