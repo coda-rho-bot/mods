@@ -62,6 +62,69 @@ fn load_filter_status() -> FilterStatus {
         .unwrap_or_default()
 }
 
+// ─── Config (writable from TUI) ──────────────────────────────────
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct Config {
+    #[serde(default, rename = "negativeFilter", skip_serializing_if = "Option::is_none")]
+    negative_filter: Option<bool>,
+    #[serde(default, rename = "ngramFilter", skip_serializing_if = "Option::is_none")]
+    ngram_filter: Option<bool>,
+    #[serde(default, rename = "ngramThreshold", skip_serializing_if = "Option::is_none")]
+    ngram_threshold: Option<f64>,
+    #[serde(default, rename = "llmConfirm", skip_serializing_if = "Option::is_none")]
+    llm_confirm: Option<bool>,
+    #[serde(default, rename = "llmDedup", skip_serializing_if = "Option::is_none")]
+    llm_dedup: Option<bool>,
+    #[serde(default, rename = "classifierModel", skip_serializing_if = "Option::is_none")]
+    classifier_model: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            negative_filter: None,
+            ngram_filter: None,
+            ngram_threshold: None,
+            llm_confirm: None,
+            llm_dedup: None,
+            classifier_model: None,
+        }
+    }
+}
+
+fn config_path() -> PathBuf { PathBuf::from(home()).join(".letta/mods/oath-keeper.config.json") }
+
+fn load_config() -> Config {
+    fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &Config) {
+    let _ = fs::write(config_path(), serde_json::to_string_pretty(config).unwrap());
+}
+
+/// Also write the filter-status file so the TUI display updates immediately
+/// (the mod re-reads config on next activation, but filter-status is what the TUI shows)
+fn update_filter_status_from_config(config: &Config) {
+    let status = serde_json::json!({
+        "negativeFilter": config.negative_filter.unwrap_or(true),
+        "ngram": config.ngram_filter.unwrap_or(true),
+        "ngramThreshold": config.ngram_threshold.unwrap_or(1.0),
+        "llmConfirm": config.llm_confirm.unwrap_or(false),
+        "llmDedup": config.llm_dedup.unwrap_or(false),
+        "filtersActive": config.negative_filter.unwrap_or(true) || config.ngram_filter.unwrap_or(true) || config.llm_confirm.unwrap_or(false) || config.llm_dedup.unwrap_or(false),
+        "classifierAgentId": "",
+        "classifierModel": config.classifier_model.clone().unwrap_or_else(|| "letta/auto-fast".to_string()),
+        "timestamp": Local::now().timestamp_millis(),
+    });
+    let path = std::path::PathBuf::from(home()).join(".letta/mods/oath-keeper-filter-status.json");
+    let _ = fs::write(path, serde_json::to_string_pretty(&status).unwrap());
+}
+
+const MODELS: &[&str] = &["letta/auto-fast", "letta/auto", "glm-5.2", "glm-5.1", "glm-5"];
+
 // ─── Helpers ─────────────────────────────────────────────────────
 
 fn home() -> String { env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()) }
@@ -649,7 +712,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
             // ── Footer ──
             let footer_text = match mode {
-                Mode::List => " q quit  j/k move  i info  d deliver  x cancel  p purge  c clear filtered  C clear completed",
+                Mode::List => " q quit  j/k move  i info  d deliver  x cancel  p purge  c clear filtered  C clear completed  |  1 NEG  2 NGRAM  3 LLM  4 DEDUP  5 model",
                 Mode::Detail => " Esc/i back to list  d deliver  x cancel",
             };
             let mut footer = vec![
@@ -740,6 +803,59 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                     status_msg = "Delivered".to_string();
                                 }
                             }
+                        }
+                        // ── Filter toggles ──
+                        KeyCode::Char('1') => {
+                            let mut cfg = load_config();
+                            let current = cfg.negative_filter.unwrap_or(true);
+                            cfg.negative_filter = Some(!current);
+                            save_config(&cfg);
+                            update_filter_status_from_config(&cfg);
+                            filter_cache = None; // force reload
+                            filter_ts = 0;
+                            status_msg = format!("NEG: {}", if !current { "on" } else { "off" });
+                        }
+                        KeyCode::Char('2') => {
+                            let mut cfg = load_config();
+                            let current = cfg.ngram_filter.unwrap_or(true);
+                            cfg.ngram_filter = Some(!current);
+                            save_config(&cfg);
+                            update_filter_status_from_config(&cfg);
+                            filter_cache = None;
+                            filter_ts = 0;
+                            status_msg = format!("NGRAM: {}", if !current { "on" } else { "off" });
+                        }
+                        KeyCode::Char('3') => {
+                            let mut cfg = load_config();
+                            let current = cfg.llm_confirm.unwrap_or(false);
+                            cfg.llm_confirm = Some(!current);
+                            save_config(&cfg);
+                            update_filter_status_from_config(&cfg);
+                            filter_cache = None;
+                            filter_ts = 0;
+                            status_msg = format!("LLM: {}", if !current { "on" } else { "off" });
+                        }
+                        KeyCode::Char('4') => {
+                            let mut cfg = load_config();
+                            let current = cfg.llm_dedup.unwrap_or(false);
+                            cfg.llm_dedup = Some(!current);
+                            save_config(&cfg);
+                            update_filter_status_from_config(&cfg);
+                            filter_cache = None;
+                            filter_ts = 0;
+                            status_msg = format!("DEDUP: {}", if !current { "on" } else { "off" });
+                        }
+                        KeyCode::Char('5') => {
+                            let mut cfg = load_config();
+                            let current = cfg.classifier_model.clone().unwrap_or_else(|| "letta/auto-fast".to_string());
+                            let idx = MODELS.iter().position(|m| *m == current).unwrap_or(0);
+                            let next = MODELS[(idx + 1) % MODELS.len()];
+                            cfg.classifier_model = Some(next.to_string());
+                            save_config(&cfg);
+                            update_filter_status_from_config(&cfg);
+                            filter_cache = None;
+                            filter_ts = 0;
+                            status_msg = format!("Model: {}", next);
                         }
                         _ => {}
                     }
