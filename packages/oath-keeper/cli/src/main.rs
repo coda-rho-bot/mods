@@ -123,7 +123,29 @@ fn update_filter_status_from_config(config: &Config) {
     let _ = fs::write(path, serde_json::to_string_pretty(&status).unwrap());
 }
 
-const MODELS: &[&str] = &["letta/auto-fast", "letta/auto", "glm-5.2", "glm-5.1", "glm-5"];
+/// Fetch available model handles from the Letta API.
+/// Filters out lc-openrouter/ (massive Letta Cloud OpenRouter proxy catalog).
+/// Cached for the session lifetime.
+fn fetch_models() -> Vec<String> {
+    static CACHE: OnceLock<Vec<String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let (base, key) = get_env();
+        let auth = if key.is_empty() { String::new() } else { format!("-H 'Authorization: Bearer {}'", key) };
+        let out = bash(&format!("curl -s '{}/v1/models' {} --max-time 3 2>/dev/null", base, auth));
+        if out.is_empty() { return vec!["letta/auto-fast".to_string(), "letta/auto".to_string()]; }
+        let parsed: Option<serde_json::Value> = serde_json::from_str(&out).ok();
+        let models: Vec<String> = parsed
+            .and_then(|v| v.as_array().map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("handle").and_then(|h| h.as_str()).map(String::from))
+                    .filter(|h| !h.starts_with("lc-openrouter/"))  // skip massive OR proxy
+                    .collect()
+            }))
+            .unwrap_or_default();
+        if models.is_empty() { vec!["letta/auto-fast".to_string(), "letta/auto".to_string()] }
+        else { models }
+    }).clone()
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -846,16 +868,18 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             status_msg = format!("DEDUP: {}", if !current { "on" } else { "off" });
                         }
                         KeyCode::Char('5') => {
+                            let models = fetch_models();
                             let mut cfg = load_config();
                             let current = cfg.classifier_model.clone().unwrap_or_else(|| "letta/auto-fast".to_string());
-                            let idx = MODELS.iter().position(|m| *m == current).unwrap_or(0);
-                            let next = MODELS[(idx + 1) % MODELS.len()];
-                            cfg.classifier_model = Some(next.to_string());
+                            let idx = models.iter().position(|m| *m == current).unwrap_or(0);
+                            let next = &models[(idx + 1) % models.len()];
+                            cfg.classifier_model = Some(next.clone());
                             save_config(&cfg);
                             update_filter_status_from_config(&cfg);
                             filter_cache = None;
                             filter_ts = 0;
-                            status_msg = format!("Model: {}", next);
+                            let next_idx = (idx + 1) % models.len();
+                            status_msg = format!("Model: {} ({}/{})", next, next_idx + 1, models.len());
                         }
                         _ => {}
                     }
