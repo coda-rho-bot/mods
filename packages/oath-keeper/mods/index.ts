@@ -15,6 +15,7 @@
 
 import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { execSync } from "node:child_process";
 
 const HOME = os.homedir();
@@ -567,6 +568,50 @@ let cachedBaseUrl: string | null = null;
 let lastPortCheck: number = 0;
 const PORT_CHECK_INTERVAL = 60_000; // re-verify port every 60s
 
+/** Discover the current Letta Code server port via ss.
+ *  Called on startup to self-heal the stale env file. */
+function discoverPort(): string | null {
+  try {
+    const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\\\.0\\\\.0\\\\.1:\\\\K\\\\d+' 2>/dev/null", { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (output) return "http://localhost:" + output;
+  } catch (e) {}
+  return null;
+}
+
+/** Self-heal the env file on startup — discover the correct port and write it. */
+function selfHealEnvFile() {
+  try {
+    let env: any = {};
+    try { env = JSON.parse(fs.readFileSync(ENV_FILE, "utf8")); } catch (e) {}
+    const currentPort = env.LETTA_BASE_URL || "";
+    // Check if the port in the env file is alive
+    let portAlive = false;
+    if (currentPort) {
+      try {
+        const code = execSync(`curl -s -o /dev/null -w '%{http_code}' '${currentPort}/v1/health' --max-time 1 2>/dev/null`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+        portAlive = code === "200";
+      } catch (e) {}
+    }
+    if (!portAlive) {
+      const discovered = discoverPort();
+      if (discovered) {
+        env.LETTA_BASE_URL = discovered;
+        // Ensure directory exists
+        try { fs.mkdirSync(path.dirname(ENV_FILE), { recursive: true }); } catch (e) {}
+        fs.writeFileSync(ENV_FILE, JSON.stringify(env, null, 2));
+        log("selfHealEnvFile: updated port to " + discovered);
+        cachedBaseUrl = discovered;
+        lastPortCheck = Date.now();
+      }
+    } else {
+      cachedBaseUrl = currentPort;
+      lastPortCheck = Date.now();
+    }
+  } catch (e) {
+    log("selfHealEnvFile error: " + e);
+  }
+}
+
 function getApiConfig() {
   let apiKey = process.env.LETTA_API_KEY;
   if (apiKey === "unset") apiKey = undefined;
@@ -601,7 +646,6 @@ function getApiConfig() {
   // Verify the port is alive — if dead, discover via ss
   if (baseUrl) {
     try {
-      execSync(`curl -s -o /dev/null -w '%{http_code}' '${baseUrl}/v1/health' --max-time 1 2>/dev/null`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
       const alive = execSync(`curl -s -o /dev/null -w '%{http_code}' '${baseUrl}/v1/health' --max-time 1 2>/dev/null`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
       if (alive !== "200") {
         log("Port " + baseUrl + " is dead, discovering...");
@@ -614,10 +658,7 @@ function getApiConfig() {
 
   // ss discovery
   if (!baseUrl) {
-    try {
-      const output = execSync("ss -tlnp 2>/dev/null | grep letta-code | head -1 | grep -oP '127\\.0\\.0\\.1:\\K\\d+' 2>/dev/null", { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
-      if (output) baseUrl = "http://localhost:" + output;
-    } catch (e) {}
+    baseUrl = discoverPort() || "";
   }
 
   if (!baseUrl) baseUrl = "http://localhost:8283";
@@ -946,6 +987,10 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
 
 export default function activate(letta: any) {
   const disposers: Array<() => void> = [];
+
+  // Self-heal the env file on startup — discover correct port
+  selfHealEnvFile();
+
   const hasTurnEvents = letta.capabilities.events?.turns === true;
   turnEventsActive = hasTurnEvents;
   log("Capabilities: " + JSON.stringify(letta.capabilities));
