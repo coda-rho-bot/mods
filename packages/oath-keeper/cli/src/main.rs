@@ -220,7 +220,19 @@ fn cached_lookup(id: &str, prefix: &str, fetch: impl Fn(&str) -> Option<String>)
 }
 
 fn api_get(path: &str) -> Option<serde_json::Value> {
-    let (base, key) = get_env();
+    // Use static cache for env to avoid health-check curl on every API call
+    static ENV_CACHE: OnceLock<std::sync::Mutex<(String, String, i64)>> = OnceLock::new();
+    let cache = ENV_CACHE.get_or_init(|| std::sync::Mutex::new((String::new(), String::new(), 0)));
+    let mut guard = cache.lock().unwrap();
+    let now = Local::now().timestamp_millis();
+    if guard.2 == 0 || now - guard.2 > 60_000 {
+        let (base, key) = get_env();
+        guard.0 = base;
+        guard.1 = key;
+        guard.2 = now;
+    }
+    let (base, key) = (guard.0.clone(), guard.1.clone());
+    drop(guard);
     let auth = if key.is_empty() { String::new() } else { format!("-H 'Authorization: Bearer {}'", key) };
     let out = bash(&format!("curl -s '{}/{}' {} --max-time 3 2>/dev/null", base, path, auth));
     if out.is_empty() { return None; }
@@ -268,10 +280,39 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut mode = Mode::List;
     let mut status_msg = String::new();
 
+    // Caches with TTL to avoid subprocess spawns every frame
+    let mut crons_cache: Vec<CronTask> = Vec::new();
+    let mut crons_ts: i64 = 0;
+    let mut filter_cache: Option<FilterStatus> = None;
+    let mut filter_ts: i64 = 0;
+    let mut env_cache: Option<(String, String)> = None;
+    let mut env_ts: i64 = 0;
+
     loop {
         let now_ms = Local::now().timestamp_millis();
         let state = load_state();
-        let crons = load_crons();
+
+        // Refresh crons at most every 30s
+        let crons = if now_ms - crons_ts > 30_000 {
+            crons_cache = load_crons();
+            crons_ts = now_ms;
+            &crons_cache
+        } else {
+            &crons_cache
+        };
+
+        // Refresh filter status at most every 5s
+        if filter_cache.is_none() || now_ms - filter_ts > 5_000 {
+            filter_cache = Some(load_filter_status());
+            filter_ts = now_ms;
+        }
+
+        // Refresh env at most every 60s
+        if env_cache.is_none() || now_ms - env_ts > 60_000 {
+            env_cache = Some(get_env());
+            env_ts = now_ms;
+        }
+
         let count = state.oaths.len();
 
         // Keep selection in bounds, auto-select first when list populates
@@ -317,7 +358,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             if count == 0 { hdr.push(Span::styled("  empty", Style::default().fg(Color::DarkGray))); }
 
             // ── Filter status line ──
-            let fs_status = load_filter_status();
+            let fs_status = filter_cache.as_ref().unwrap();
             let neg_label = if fs_status.negative_filter { "NEG:on" } else { "NEG:off" };
             let neg_color = if fs_status.negative_filter { Color::Green } else { Color::Red };
             let ngram_label = format!("NGRAM:{} (>{}{})", if fs_status.ngram { "on" } else { "off" }, fs_status.ngram_threshold, "");
@@ -570,7 +611,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 Line::from(""),
                                 Line::from(Span::styled("Delivery:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
                                 Line::from(Span::styled(
-                                    format!("  POST {}/v1/conversations/{}/messages", get_env().0, o.conversation_id),
+                                    format!("  POST {}/v1/conversations/{}/messages", env_cache.as_ref().unwrap().0, o.conversation_id),
                                     Style::default().fg(Color::Green),
                                 )),
                                 Line::from(Span::styled(
@@ -624,7 +665,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         })?;
 
         // ── Input ──
-        if event::poll(Duration::from_millis(500))? {
+        if event::poll(Duration::from_millis(1000))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press { continue; }
                 let sel = list_state.selected();
