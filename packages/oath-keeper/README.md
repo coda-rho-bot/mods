@@ -99,7 +99,7 @@ pending → queued → delivering → delivered
 ## Installation
 
 ```bash
-letta install npm:@letta-ai/oath-keeper
+letta install npm:@coda-rho-bot/oath-keeper
 ```
 
 Then run `/reload` in Letta Code.
@@ -233,6 +233,11 @@ Each entry shows 3 lines: status badge + promise text, done/timer timestamp + so
 | `p` | Purge all oaths |
 | `c` | Clear filtered entries (prefilter_rejected + false_positive) |
 | `C` | Clear completed entries (delivered, failed, false_positive, prefilter_rejected) |
+| `1` | Toggle negative filter |
+| `2` | Toggle n-gram filter |
+| `3` | Toggle LLM confirm |
+| `4` | Toggle LLM dedup |
+| `5` | Cycle classifier model (fetched from API) |
 | `q` | Quit |
 
 Reads from `~/.letta/mods/oath-keeper.state.json`. Requires Rust (uses [ratatui](https://github.com/ratatui/ratatui) + [crossterm](https://github.com/crossterm-rs/crossterm)).
