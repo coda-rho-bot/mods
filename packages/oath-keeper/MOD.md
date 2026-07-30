@@ -1,5 +1,5 @@
 ---
-name: "@letta-ai/oath-keeper"
+name: "@coda-rho-bot/oath-keeper"
 description: "Passively detects when agents make follow-up promises and automatically delivers on them"
 ---
 
