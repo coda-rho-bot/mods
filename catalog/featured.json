@@ -16,6 +16,11 @@
     {
       "type": "npm",
       "package": "@letta-ai/image-understanding"
+    },
+    {
+      "type": "git",
+      "repository": "github.com/coda-rho-bot/mods",
+      "directory": "packages/oath-keeper"
     }
   ]
 }
