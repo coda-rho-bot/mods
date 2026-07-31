@@ -912,8 +912,8 @@ async function pollCycle() {
     // Run delivery logic first
     await pollDeliveryCycle();
 
-    // Then scan for new promises — SKIP when turn_end handles detection
-    if (turnEventsActive) return;
+    // Then scan for new promises across ALL conversations
+    // (turn_end may or may not fire — polling ensures channel messages are caught)
     const scanStore = StateStore.load("scan-phase");
     if (scanStore.hasActiveOaths()) { log("Skipping scan — active oaths"); return; }
 
@@ -921,12 +921,14 @@ async function pollCycle() {
     const latest = await fetchLatestAgentMessage();
     if (latest && scanStore.lastScannedMessageId !== latest.id) {
       if (latest.isDeliveryResponse) { log("Skipping — delivery response"); return; }
+      // Use the conversation ID from the message's run, falling back to env convId
+      const msgConvId = latest.conversationId || convId;
       const preFilter = detectPromiseRegex(latest.text);
       if (preFilter) {
         log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
         const confirmed = await confirmPromise(latest.text);
         if (!confirmed) {
-          logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, convId, agentId);
+          logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, agentId);
           scanStore.setScanned(latest.id);
           scanStore.save();
         }
@@ -935,7 +937,7 @@ async function pollCycle() {
           const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
                                 scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
           if (!alreadyExists) {
-            const oath = createOath(confirmed.promise, latest.userContext, convId, agentId, latest.id, "polling", confirmed.delayMs);
+            const oath = createOath(confirmed.promise, latest.userContext, msgConvId, agentId, latest.id, "polling", confirmed.delayMs);
             scanStore.addOath(oath);
             scanStore.save();
           }
@@ -952,11 +954,12 @@ async function pollCycle() {
 
 // ─── Message fetching ────────────────────────────────────────────
 
-async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean } | null> {
+async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string } | null> {
   const { baseUrl, apiKey, agentId, convId } = getApiConfig();
-  if (!agentId || !convId) return null;
+  if (!agentId) return null;
   try {
-    const resp = await fetch(baseUrl + "/v1/agents/" + agentId + "/messages?conversation_id=" + convId + "&limit=50", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+    // Fetch recent messages across ALL conversations (no conversation_id filter)
+    const resp = await fetch(baseUrl + "/v1/agents/" + agentId + "/messages?limit=50", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
     if (!resp.ok) return null;
     const data: any = await resp.json();
     const messages = Array.isArray(data) ? data : (data.messages || []);
@@ -964,12 +967,25 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
     messages.sort((a: any, b: any) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
     let assistantMsg: { id: string; text: string } | null = null;
     let userContext = "(no context)";
+    let msgConversationId = convId;
     for (const m of messages) {
       const mt = m.message_type || "";
       if (!assistantMsg && mt === "assistant_message") {
         const c = m.content;
         const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
-        if (text.trim()) assistantMsg = { id: m.id || "", text };
+        if (text.trim()) {
+          assistantMsg = { id: m.id || "", text };
+          // Look up conversation_id from the run
+          if (m.run_id) {
+            try {
+              const runResp = await fetch(baseUrl + "/v1/runs/" + m.run_id, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+              if (runResp.ok) {
+                const run: any = await runResp.json();
+                if (run.conversation_id) msgConversationId = run.conversation_id;
+              }
+            } catch (e) {}
+          }
+        }
       }
       if (userContext === "(no context)" && mt === "user_message") {
         const c = m.content;
@@ -979,7 +995,7 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
       }
       if (assistantMsg && userContext !== "(no context)") break;
     }
-    return assistantMsg ? { ...assistantMsg, userContext, isDeliveryResponse: userContext.includes("[Oath Keeper]") } : null;
+    return assistantMsg ? { ...assistantMsg, userContext, isDeliveryResponse: userContext.includes("[Oath Keeper]"), conversationId: msgConversationId } : null;
   } catch (e) { log("fetchLatestAgentMessage error: " + e); return null; }
 }
 
