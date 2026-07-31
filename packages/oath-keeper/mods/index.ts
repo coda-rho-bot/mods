@@ -970,12 +970,13 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
     let msgConversationId = convId;
     for (const m of messages) {
       const mt = m.message_type || "";
+
+      // Check assistant_message for promise language
       if (!assistantMsg && mt === "assistant_message") {
         const c = m.content;
         const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
         if (text.trim()) {
           assistantMsg = { id: m.id || "", text };
-          // Look up conversation_id from the run
           if (m.run_id) {
             try {
               const runResp = await fetch(baseUrl + "/v1/runs/" + m.run_id, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
@@ -987,6 +988,31 @@ async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; us
           }
         }
       }
+
+      // Check MessageChannel tool calls for promise language
+      // Agents send messages to channels (Telegram, Discord) via MessageChannel —
+      // the promise text is in the tool call arguments, not the assistant message
+      if (!assistantMsg && mt === "approval_request_message" && m.tool_call) {
+        const tc = m.tool_call;
+        if (tc.name === "MessageChannel") {
+          let args: any = tc.arguments;
+          if (typeof args === "string") { try { args = JSON.parse(args); } catch (e) { args = {}; } }
+          const msgText = args.message || "";
+          if (msgText.trim() && msgText.length > 15) {
+            assistantMsg = { id: m.id || "", text: msgText };
+            if (m.run_id) {
+              try {
+                const runResp = await fetch(baseUrl + "/v1/runs/" + m.run_id, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+                if (runResp.ok) {
+                  const run: any = await runResp.json();
+                  if (run.conversation_id) msgConversationId = run.conversation_id;
+                }
+              } catch (e) {}
+            }
+          }
+        }
+      }
+
       if (userContext === "(no context)" && mt === "user_message") {
         const c = m.content;
         let text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
