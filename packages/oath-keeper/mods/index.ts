@@ -926,7 +926,19 @@ async function pollCycle() {
       const preFilter = detectPromiseRegex(latest.text);
       if (preFilter) {
         log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
-        const confirmed = await confirmPromise(latest.text);
+        let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null = null;
+        let llmTokens: { prompt: number; completion: number; total: number } | undefined;
+
+        if (isLlmConfirmEnabled()) {
+          confirmed = await confirmPromise(latest.text);
+          log("polling LLM: " + (confirmed ? "CONFIRMED: " + confirmed.promise.slice(0, 60) : "REJECTED"));
+          if (confirmed?.tokens) llmTokens = confirmed.tokens;
+        } else {
+          // LLM confirm disabled — create oath directly from message text
+          confirmed = { promise: latest.text.slice(0, 300), delayMs: DEFAULT_DELAY_MS };
+          log("polling: LLM confirm disabled — creating oath directly");
+        }
+
         if (!confirmed) {
           logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, agentId);
           scanStore.setScanned(latest.id);
@@ -938,8 +950,11 @@ async function pollCycle() {
                                 scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
           if (!alreadyExists) {
             const oath = createOath(confirmed.promise, latest.userContext, msgConvId, agentId, latest.id, "polling", confirmed.delayMs);
+            oath.ngramScore = preFilter.score;
+            oath.llmTokens = llmTokens;
             scanStore.addOath(oath);
             scanStore.save();
+            log("polling: oath created — " + oath.id + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
           }
         }
       } else {
