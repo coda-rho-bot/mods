@@ -634,7 +634,9 @@ function getApiConfig() {
 
   let baseUrl = "";
   let envPort = process.env.LETTA_BASE_URL || "";
-  if (envPort && envPort !== "unset") baseUrl = envPort;
+  // Never use the cloud API for delivery — it doesn't have client-side tools (Bash, Read, Edit, Write).
+  // Always prefer localhost. The cloud relay only provides server-side tools.
+  if (envPort && envPort !== "unset" && envPort.includes("localhost")) baseUrl = envPort;
 
   if (!baseUrl) {
     try {
@@ -843,10 +845,11 @@ async function pollDeliveryCycle() {
     queueStore.save();
 
     // 3. Try to deliver one queued oath
-    // turn_end { continue } is preferred, but if the oath has been queued
-    // for more than 60 seconds without a turn_end firing (user idle),
-    // fall back to REST API delivery.
-    const QUEUED_TIMEOUT = 60_000; // 60 seconds before REST fallback
+    // turn_end { continue } is preferred (full tool access via desktop app).
+    // REST API fallback only has server-side tools (no Bash/Read/Edit/Write),
+    // which can cause doom loops if the agent tries to use client-side tools.
+    // Use a long timeout so oaths are delivered via turn_end when possible.
+    const QUEUED_TIMEOUT = 300_000; // 5 minutes before REST fallback
     let queuedOath = undefined;
 
     if (turnEventsActive) {
