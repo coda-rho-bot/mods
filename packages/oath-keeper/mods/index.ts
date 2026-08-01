@@ -541,8 +541,9 @@ async function confirmPromise(text: string): Promise<{ promise: string; delayMs:
 
 function buildDeliveryPrompt(oath: Oath): string {
   let prompt = '[Oath Keeper] You previously promised the user:\n"' + oath.promise + '"\n\n'
-    + 'Deliver on that promise now. You have full tool access — use whatever tools you need to follow through.\n'
-    + 'Start your response with "[Oath Delivered]".';
+    + 'Deliver on that promise now.\n'
+    + 'Start your response with "[Oath Delivered]".\n\n'
+    + 'IMPORTANT: If you are unable to make tool calls (Bash, Read, Edit, Write), you are in a REST API delivery context with limited tools. Do NOT attempt file operations or web fetches that may loop. Instead, briefly report what you would do and mark it as delivered. Do not repeat the same action twice.';
 
   if (oath.context && oath.context !== "(turn_end)" && oath.context !== "(no context)") {
     prompt += '\n\nFor context, the user originally said:\n"' + oath.context + '"';
@@ -843,10 +844,11 @@ async function pollDeliveryCycle() {
     queueStore.save();
 
     // 3. Try to deliver one queued oath
-    // turn_end { continue } is preferred, but if the oath has been queued
-    // for more than 60 seconds without a turn_end firing (user idle),
-    // fall back to REST API delivery.
-    const QUEUED_TIMEOUT = 60_000; // 60 seconds before REST fallback
+    // turn_end { continue } is preferred (full tool access via desktop app).
+    // REST API fallback only has server-side tools (no Bash/Read/Edit/Write),
+    // which can cause doom loops if the agent tries to use client-side tools.
+    // Use a long timeout so oaths are delivered via turn_end when possible.
+    const QUEUED_TIMEOUT = 300_000; // 5 minutes before REST fallback
     let queuedOath = undefined;
 
     if (turnEventsActive) {
