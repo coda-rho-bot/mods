@@ -541,9 +541,8 @@ async function confirmPromise(text: string): Promise<{ promise: string; delayMs:
 
 function buildDeliveryPrompt(oath: Oath): string {
   let prompt = '[Oath Keeper] You previously promised the user:\n"' + oath.promise + '"\n\n'
-    + 'Deliver on that promise now.\n'
-    + 'Start your response with "[Oath Delivered]".\n\n'
-    + 'IMPORTANT: If you are unable to make tool calls (Bash, Read, Edit, Write), you are in a REST API delivery context with limited tools. Do NOT attempt file operations or web fetches that may loop. Instead, briefly report what you would do and mark it as delivered. Do not repeat the same action twice.';
+    + 'Deliver on that promise now. You have full tool access — use whatever tools you need to follow through.\n'
+    + 'Start your response with "[Oath Delivered]".';
 
   if (oath.context && oath.context !== "(turn_end)" && oath.context !== "(no context)") {
     prompt += '\n\nFor context, the user originally said:\n"' + oath.context + '"';
@@ -635,7 +634,9 @@ function getApiConfig() {
 
   let baseUrl = "";
   let envPort = process.env.LETTA_BASE_URL || "";
-  if (envPort && envPort !== "unset") baseUrl = envPort;
+  // Never use the cloud API for delivery — it doesn't have client-side tools (Bash, Read, Edit, Write).
+  // Always prefer localhost. The cloud relay only provides server-side tools.
+  if (envPort && envPort !== "unset" && envPort.includes("localhost")) baseUrl = envPort;
 
   if (!baseUrl) {
     try {
