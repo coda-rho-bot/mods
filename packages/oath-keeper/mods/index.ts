@@ -1097,7 +1097,18 @@ async function pollCycle() {
         const preFilter = detectPromiseRegex(latest.text);
         if (preFilter) {
           log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
-          let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null = null;
+
+          // Dedup check BEFORE LLM — saves tokens and prevents duplicates when LLM is unavailable
+          const alreadyScanned = scanStore.oaths.some((o) => o.sourceMessageId === latest.id) ||
+                                 scanStore.hasRecentPromise(latest.text.slice(0, 300));
+          if (alreadyScanned) {
+            log("Skipping — already have oath for this message");
+            scanStore.setScannedForAgent(scanAgentId, latest.id);
+            scanStore.save();
+            continue;
+          }
+
+          let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number }; error?: boolean; status?: number } | null = null;
           let llmTokens: { prompt: number; completion: number; total: number } | undefined;
 
           if (isLlmConfirmEnabled()) {
@@ -1118,27 +1129,18 @@ async function pollCycle() {
           }
           if (confirmed?.error) {
             // LLM failed (402, rate limit, etc.) — create oath with llm_failed status
-            // BUT check dedup first — don't create duplicates
-            const alreadyExists = scanStore.hasRecentPromise(latest.text.slice(0, 300)) ||
-                                  scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
-            if (!alreadyExists) {
-              const oath = createOath(latest.text.slice(0, 300), latest.userContext, msgConvId, scanAgentId, latest.id, "polling", DEFAULT_DELAY_MS);
-              oath.ngramScore = preFilter.score;
-              oath.status = "llm_failed";
-              scanStore.addOath(oath);
-              scanStore.save();
-              log("polling: oath created (llm_failed) — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " score=" + preFilter.score);
-            }
+            const oath = createOath(latest.text.slice(0, 300), latest.userContext, msgConvId, scanAgentId, latest.id, "polling", DEFAULT_DELAY_MS);
+            oath.ngramScore = preFilter.score;
+            oath.status = "llm_failed";
+            scanStore.addOath(oath);
+            scanStore.save();
+            log("polling: oath created (llm_failed) — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " score=" + preFilter.score);
           } else if (confirmed && !confirmed.error) {
-            const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
-                                  scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
-            if (!alreadyExists) {
-              const oath = createOath(confirmed.promise, latest.userContext, msgConvId, scanAgentId, latest.id, "polling", confirmed.delayMs);
-              oath.ngramScore = preFilter.score;
-              oath.llmTokens = llmTokens;
-              scanStore.addOath(oath);
-              log("polling: oath created — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
-            }
+            const oath = createOath(confirmed.promise, latest.userContext, msgConvId, scanAgentId, latest.id, "polling", confirmed.delayMs);
+            oath.ngramScore = preFilter.score;
+            oath.llmTokens = llmTokens;
+            scanStore.addOath(oath);
+            log("polling: oath created — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
           }
         }
         scanStore.setScannedForAgent(scanAgentId, latest.id);
