@@ -1144,7 +1144,7 @@ async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: stri
       // Check assistant_message for promise language
       if (mt === "assistant_message") {
         const c = m.content;
-        text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+        const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
         if (text.trim()) msgText = text;
       }
       // Check MessageChannel tool calls for promise language
