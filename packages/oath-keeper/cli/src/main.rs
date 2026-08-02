@@ -49,6 +49,8 @@ struct State {
     last_scanned_message_ids: Option<serde_json::Value>,
     #[serde(default, rename = "_pollVer")]
     poll_ver: Option<String>,
+    #[serde(default, rename = "purgeEpoch")]
+    purge_epoch: Option<i64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -792,6 +794,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         KeyCode::Char('p') => {
                             let mut st = load_state();
                             st.oaths.clear();
+                            st.purge_epoch = Some(Local::now().timestamp_millis());
                             save_state(&st);
                             state_cache = Some(st);
                             state_mtime = fs::metadata(state_path())
@@ -1006,6 +1009,7 @@ fn main() {
     if purge {
         let mut st = load_state();
         st.oaths.clear();
+        st.purge_epoch = Some(Local::now().timestamp_millis());
         save_state(&st);
         println!("Purged.");
         return;
