@@ -210,6 +210,7 @@ interface StateData {
   lastScannedMessageId: string | null;
   lastScannedMessageIds: Record<string, string> | null;
   _pollVer: string;
+  purgeEpoch?: number;
 }
 
 class StateStore {
@@ -224,7 +225,13 @@ class StateStore {
     let data: StateData;
     try {
       const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      data = { oaths: parsed.oaths || [], lastScannedMessageId: parsed.lastScannedMessageId || null, lastScannedMessageIds: parsed.lastScannedMessageIds || null, _pollVer: parsed._pollVer || "" };
+      data = { oaths: parsed.oaths || [], lastScannedMessageId: parsed.lastScannedMessageId || null, lastScannedMessageIds: parsed.lastScannedMessageIds || null, _pollVer: parsed._pollVer || "", purgeEpoch: parsed.purgeEpoch || 0 };
+      // Drop any oaths from before the last purge (handles race: mod loaded pre-purge, saves post-purge)
+      if (data.purgeEpoch) {
+        const before = data.oaths.length;
+        data.oaths = data.oaths.filter((o) => o.createdAt > data.purgeEpoch!);
+        if (before !== data.oaths.length) log(`StateStore.load: dropped ${before - data.oaths.length} pre-purge oaths`);
+      }
     } catch (e) {
       data = { oaths: [], lastScannedMessageId: null, lastScannedMessageIds: null, _pollVer: "" };
     }
@@ -272,6 +279,7 @@ class StateStore {
   get oaths(): Oath[] { return this.data.oaths; }
   get lastScannedMessageId(): string | null { return this.data.lastScannedMessageId; }
   get pollVer(): string { return this.data._pollVer; }
+  setPurgeEpoch(ts: number): StateStore { this.data.purgeEpoch = ts; this.dirty = true; return this; }
   hasActiveOaths(): boolean { return this.data.oaths.some((o) => o.status === "pending" || o.status === "queued" || o.status === "delivering"); }
 
   /** Get active oaths (pending, queued, or delivering) for LLM dedup comparison */
