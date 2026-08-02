@@ -54,8 +54,10 @@ function discoverLettaBinary(): string {
 
 function isAppServerRunning(): boolean {
   try {
-    const code = execSync(`curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:${APP_SERVER_PORT}/v1/health' --max-time 1 2>/dev/null`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
-    return code === "200";
+    // The App Server is a WebSocket server, not HTTP — /v1/health won't work.
+    // Just check if the port is listening.
+    const result = execSync(`ss -tlnp 2>/dev/null | grep '127.0.0.1:${APP_SERVER_PORT}' | grep -q LISTEN && echo yes || echo no`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    return result === "yes";
   } catch (e) { return false; }
 }
 
