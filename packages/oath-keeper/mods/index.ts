@@ -186,7 +186,7 @@ interface Oath {
   promise: string;
   context: string;
   sourceMessageId?: string;
-  deliveryMode?: "turn_end" | "rest_api" | "polling";
+  deliveryMode?: "turn_end" | "rest_api" | "polling" | "sdk";
   createdAt: number;
   dueAt: number;
   status: "pending" | "queued" | "delivering" | "delivered" | "failed" | "false_positive" | "prefilter_rejected";
@@ -199,6 +199,7 @@ interface Oath {
 interface StateData {
   oaths: Oath[];
   lastScannedMessageId: string | null;
+  lastScannedMessageIds: Record<string, string> | null;
   _pollVer: string;
 }
 
@@ -214,9 +215,9 @@ class StateStore {
     let data: StateData;
     try {
       const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      data = { oaths: parsed.oaths || [], lastScannedMessageId: parsed.lastScannedMessageId || null, _pollVer: parsed._pollVer || "" };
+      data = { oaths: parsed.oaths || [], lastScannedMessageId: parsed.lastScannedMessageId || null, lastScannedMessageIds: parsed.lastScannedMessageIds || null, _pollVer: parsed._pollVer || "" };
     } catch (e) {
-      data = { oaths: [], lastScannedMessageId: null, _pollVer: "" };
+      data = { oaths: [], lastScannedMessageId: null, lastScannedMessageIds: null, _pollVer: "" };
     }
     log(`StateStore.load("${operation}") — ${data.oaths.length} oaths`);
     return new StateStore(data, operation);
@@ -233,6 +234,15 @@ class StateStore {
   }
   addOath(oath: Oath): StateStore { this.data.oaths.push(oath); this.dirty = true; log(`StateStore.addOath("${oath.id}")`); return this; }
   setScanned(msgId: string): StateStore { this.data.lastScannedMessageId = msgId; this.dirty = true; return this; }
+  setScannedForAgent(agentId: string, msgId: string): StateStore {
+    if (!this.data.lastScannedMessageIds) this.data.lastScannedMessageIds = {};
+    this.data.lastScannedMessageIds[agentId] = msgId;
+    this.dirty = true;
+    return this;
+  }
+  getScannedForAgent(agentId: string): string | null {
+    return this.data.lastScannedMessageIds?.[agentId] || null;
+  }
   setPollVer(ver: string): StateStore { this.data._pollVer = ver; this.dirty = true; return this; }
   prune(now: number): StateStore {
     const before = this.data.oaths.length;
@@ -1012,54 +1022,56 @@ async function pollCycle() {
     // Run delivery logic first
     await pollDeliveryCycle();
 
-    // Then scan for new promises across ALL conversations
+    // Then scan for new promises across ALL agents' conversations
     // (turn_end may or may not fire — polling ensures channel messages are caught)
     const scanStore = StateStore.load("scan-phase");
     if (scanStore.hasActiveOaths()) { log("Skipping scan — active oaths"); return; }
 
-    const { convId, agentId } = getApiConfig();
-    const latest = await fetchLatestAgentMessage();
-    if (latest && scanStore.lastScannedMessageId !== latest.id) {
-      if (latest.isDeliveryResponse) { log("Skipping — delivery response"); return; }
-      // Use the conversation ID from the message's run, falling back to env convId
-      const msgConvId = latest.conversationId || convId;
-      const preFilter = detectPromiseRegex(latest.text);
-      if (preFilter) {
-        log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
-        let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null = null;
-        let llmTokens: { prompt: number; completion: number; total: number } | undefined;
+    const { convId } = getApiConfig();
+    const agentIds = await discoverAgentIds();
+    for (const scanAgentId of agentIds) {
+      const latest = await fetchLatestAgentMessage(scanAgentId);
+      const lastScanned = scanStore.getScannedForAgent(scanAgentId);
+      if (latest && lastScanned !== latest.id) {
+        if (latest.isDeliveryResponse) { log("Skipping — delivery response"); scanStore.setScannedForAgent(scanAgentId, latest.id); scanStore.save(); continue; }
+        const msgConvId = latest.conversationId || convId;
+        const preFilter = detectPromiseRegex(latest.text);
+        if (preFilter) {
+          log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
+          let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null = null;
+          let llmTokens: { prompt: number; completion: number; total: number } | undefined;
 
-        if (isLlmConfirmEnabled()) {
-          confirmed = await confirmPromise(latest.text);
-          log("polling LLM: " + (confirmed ? "CONFIRMED: " + confirmed.promise.slice(0, 60) : "REJECTED"));
-          if (confirmed?.tokens) llmTokens = confirmed.tokens;
+          if (isLlmConfirmEnabled()) {
+            confirmed = await confirmPromise(latest.text);
+            log("polling LLM: " + (confirmed ? "CONFIRMED: " + confirmed.promise.slice(0, 60) : "REJECTED"));
+            if (confirmed?.tokens) llmTokens = confirmed.tokens;
+          } else {
+            confirmed = { promise: latest.text.slice(0, 300), delayMs: DEFAULT_DELAY_MS };
+            log("polling: LLM confirm disabled — creating oath directly");
+          }
+
+          if (!confirmed) {
+            logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, scanAgentId);
+            scanStore.setScannedForAgent(scanAgentId, latest.id);
+            scanStore.save();
+          }
+          if (confirmed) {
+            scanStore.setScannedForAgent(scanAgentId, latest.id);
+            const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
+                                  scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
+            if (!alreadyExists) {
+              const oath = createOath(confirmed.promise, latest.userContext, msgConvId, scanAgentId, latest.id, "polling", confirmed.delayMs);
+              oath.ngramScore = preFilter.score;
+              oath.llmTokens = llmTokens;
+              scanStore.addOath(oath);
+              scanStore.save();
+              log("polling: oath created — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
+            }
+          }
         } else {
-          // LLM confirm disabled — create oath directly from message text
-          confirmed = { promise: latest.text.slice(0, 300), delayMs: DEFAULT_DELAY_MS };
-          log("polling: LLM confirm disabled — creating oath directly");
-        }
-
-        if (!confirmed) {
-          logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, agentId);
-          scanStore.setScanned(latest.id);
+          scanStore.setScannedForAgent(scanAgentId, latest.id);
           scanStore.save();
         }
-        if (confirmed) {
-          scanStore.setScanned(latest.id);
-          const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
-                                scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
-          if (!alreadyExists) {
-            const oath = createOath(confirmed.promise, latest.userContext, msgConvId, agentId, latest.id, "polling", confirmed.delayMs);
-            oath.ngramScore = preFilter.score;
-            oath.llmTokens = llmTokens;
-            scanStore.addOath(oath);
-            scanStore.save();
-            log("polling: oath created — " + oath.id + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
-          }
-        }
-      } else {
-        scanStore.setScanned(latest.id);
-        scanStore.save();
       }
     }
   } catch (e) {
@@ -1067,14 +1079,37 @@ async function pollCycle() {
   }
 }
 
+// ─── Agent discovery ─────────────────────────────────────────────
+
+let cachedAgentIds: string[] | null = null;
+let agentCacheTime = 0;
+const AGENT_CACHE_TTL = 300_000; // 5 minutes
+
+async function discoverAgentIds(): Promise<string[]> {
+  const now = Date.now();
+  if (cachedAgentIds && (now - agentCacheTime) < AGENT_CACHE_TTL) return cachedAgentIds;
+  const { baseUrl, apiKey } = getApiConfig();
+  try {
+    const resp = await fetch(baseUrl + "/v1/agents?limit=100", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+    if (!resp.ok) { log("discoverAgentIds: HTTP " + resp.status); return cachedAgentIds || []; }
+    const data: any = await resp.json();
+    const agents = Array.isArray(data) ? data : (data.data || data.agents || []);
+    cachedAgentIds = agents.map((a: any) => a.id).filter((id: string) => id);
+    agentCacheTime = now;
+    log("discoverAgentIds: found " + cachedAgentIds.length + " agents");
+    return cachedAgentIds;
+  } catch (e) { log("discoverAgentIds error: " + e); return cachedAgentIds || []; }
+}
+
 // ─── Message fetching ────────────────────────────────────────────
 
-async function fetchLatestAgentMessage(): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string } | null> {
-  const { baseUrl, apiKey, agentId, convId } = getApiConfig();
-  if (!agentId) return null;
+async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string } | null> {
+  const { baseUrl, apiKey, agentId: envAgentId, convId } = getApiConfig();
+  const targetAgentId = scanAgentId || envAgentId;
+  if (!targetAgentId) return null;
   try {
     // Fetch recent messages across ALL conversations (no conversation_id filter)
-    const resp = await fetch(baseUrl + "/v1/agents/" + agentId + "/messages?limit=50", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+    const resp = await fetch(baseUrl + "/v1/agents/" + targetAgentId + "/messages?limit=50", { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
     if (!resp.ok) return null;
     const data: any = await resp.json();
     const messages = Array.isArray(data) ? data : (data.messages || []);
