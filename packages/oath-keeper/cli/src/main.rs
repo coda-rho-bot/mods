@@ -540,6 +540,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 "failed" => ("FAILED".to_string(), Color::Red),
                                 "false_positive" => ("FALSE POS".to_string(), Color::DarkGray),
                                 "prefilter_rejected" => ("PREFILTER".to_string(), Color::Magenta),
+                                "llm_failed" => ("LLM FAIL".to_string(), Color::LightRed),
                                 _ => ("UNKNOWN".to_string(), Color::Gray),
                             };
 
@@ -644,6 +645,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 "failed" => ("FAILED", Color::Red),
                                 "false_positive" => ("FALSE POS", Color::DarkGray),
                                 "prefilter_rejected" => ("PREFILTER", Color::Magenta),
+                                "llm_failed" => ("LLM FAIL", Color::LightRed),
                                 _ => ("UNKNOWN", Color::Gray),
                             };
 
