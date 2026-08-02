@@ -41,7 +41,15 @@ struct Oath {
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
-struct State { oaths: Vec<Oath> }
+struct State {
+    oaths: Vec<Oath>,
+    #[serde(default)]
+    last_scanned_message_id: Option<String>,
+    #[serde(default, rename = "lastScannedMessageIds")]
+    last_scanned_message_ids: Option<serde_json::Value>,
+    #[serde(default, rename = "_pollVer")]
+    poll_ver: Option<String>,
+}
 
 #[derive(Deserialize, Debug, Default)]
 struct FilterStatus {
@@ -766,7 +774,9 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         }
                         KeyCode::Char('i') => { if count > 0 { mode = Mode::Detail; } }
                         KeyCode::Char('p') => {
-                            save_state(&State::default());
+                            let mut st = load_state();
+                            st.oaths.clear();
+                            save_state(&st);
                             list_state.select(Some(0));
                             status_msg = "Purged all oaths".to_string();
                         }
@@ -956,7 +966,13 @@ fn main() {
     let watch = env::args().any(|a| a == "--watch" || a == "-w");
     let purge = env::args().any(|a| a == "--purge" || a == "-p");
 
-    if purge { save_state(&State::default()); println!("Purged."); return; }
+    if purge {
+        let mut st = load_state();
+        st.oaths.clear();
+        save_state(&st);
+        println!("Purged.");
+        return;
+    }
 
     // TUI is default; --plain for text output
     if !watch && env::args().any(|a| a == "--plain") {
