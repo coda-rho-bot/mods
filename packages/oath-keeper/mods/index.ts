@@ -66,7 +66,7 @@ function startAppServer(): void {
   log("Starting App Server: " + binary + " server --listen ws://127.0.0.1:" + APP_SERVER_PORT);
   try {
     appServerProcess = spawn(parts[0], [...parts.slice(1), "server", "--listen", "ws://127.0.0.1:" + APP_SERVER_PORT], {
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["ignore", "ignore", "ignore"],
       env: { ...process.env, HOME: HOME },
       detached: false,
     });
@@ -1025,7 +1025,9 @@ async function pollCycle() {
     // Then scan for new promises across ALL agents' conversations
     // (turn_end may or may not fire — polling ensures channel messages are caught)
     const scanStore = StateStore.load("scan-phase");
-    if (scanStore.hasActiveOaths()) { log("Skipping scan — active oaths"); return; }
+    // Don't skip scan when there are active oaths — with multi-agent scanning,
+    // one agent's active oath shouldn't block scanning other agents.
+    // Per-agent lastScannedMessageIds prevents duplicate oaths.
 
     const { convId } = getApiConfig();
     const agentIds = await discoverAgentIds();
