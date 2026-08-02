@@ -16,7 +16,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 
 const HOME = os.homedir();
 const STATE_FILE = `${HOME}/.letta/mods/oath-keeper.state.json`;
@@ -27,6 +27,62 @@ const POLL_INTERVAL_MS = 15_000;
 const DEFAULT_DELAY_MS = 300_000; // 5 minutes fallback if LLM doesn't specify
 const VERBOSE_FILE = `${HOME}/.letta/mods/oath-keeper.verbose`;
 const CONFIG_FILE = `${HOME}/.letta/mods/oath-keeper.config.json`;
+const APP_SERVER_PORT = 4500;
+const DELIVERY_SCRIPT = `${HOME}/.letta/scripts/deliver-oath.mjs`;
+let appServerProcess: ReturnType<typeof spawn> | null = null;
+
+// ─── App Server Management ───────────────────────────────────────
+// The App Server provides a websocket endpoint that the Agent SDK connects to.
+// This ensures delivery has full tool access (Bash, Read, Edit, Write),
+// unlike the REST API which only provides server-side tools via cloud relay.
+
+function discoverLettaBinary(): string {
+  try {
+    // The AppImage mount path changes on each restart — discover it
+    const mounts = fs.readdirSync("/tmp").filter(d => d.startsWith(".mount_letta-"));
+    for (const mount of mounts) {
+      const binary = `/tmp/${mount}/letta-code`;
+      const js = `/tmp/${mount}/resources/app.asar.unpacked/node_modules/@letta-ai/letta-code/letta.js`;
+      if (fs.existsSync(binary) && fs.existsSync(js)) {
+        return `${binary} ${js}`;
+      }
+    }
+  } catch (e) {}
+  // Fallback to the shell shim
+  return "/tmp/letta-code-shell-shim/letta";
+}
+
+function isAppServerRunning(): boolean {
+  try {
+    const code = execSync(`curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1:${APP_SERVER_PORT}/v1/health' --max-time 1 2>/dev/null`, { encoding: "utf8", timeout: 2000, stdio: ["pipe", "pipe", "pipe"] }).trim();
+    return code === "200";
+  } catch (e) { return false; }
+}
+
+function startAppServer(): void {
+  if (isAppServerRunning()) { log("App Server already running on port " + APP_SERVER_PORT); return; }
+  const binary = discoverLettaBinary();
+  const parts = binary.split(" ");
+  log("Starting App Server: " + binary + " server --listen ws://127.0.0.1:" + APP_SERVER_PORT);
+  try {
+    appServerProcess = spawn(parts[0], [...parts.slice(1), "server", "--listen", "ws://127.0.0.1:" + APP_SERVER_PORT], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, HOME: HOME },
+      detached: false,
+    });
+    appServerProcess.on("error", (e: any) => log("App Server error: " + e));
+    appServerProcess.on("exit", (code: any, signal: any) => log("App Server exited: code=" + code + " signal=" + signal));
+    log("App Server spawned PID=" + appServerProcess.pid);
+  } catch (e) { log("Failed to start App Server: " + e); }
+}
+
+function stopAppServer(): void {
+  if (appServerProcess) {
+    try { appServerProcess.kill("SIGTERM"); } catch (e) {}
+    appServerProcess = null;
+    log("App Server stopped");
+  }
+}
 
 function isVerbose(): boolean {
   try { return fs.existsSync(VERBOSE_FILE); } catch (e) { return false; }
@@ -705,7 +761,9 @@ async function isConversationBusy(baseUrl: string, apiKey: string | undefined, c
   }
 }
 
-/** Try to deliver an oath. Returns "busy" on 409 or empty response. */
+/** Try to deliver an oath via the Agent SDK (App Server websocket).
+ *  This provides full tool access (Bash, Read, Edit, Write) unlike the
+ *  REST API which only has server-side tools via cloud relay. */
 async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fail"; answer: string }> {
   const { baseUrl, apiKey, convId } = getApiConfig();
   const targetConv = (oath.conversationId && oath.conversationId !== "default") ? oath.conversationId : convId;
@@ -717,8 +775,50 @@ async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fa
     return { status: "busy", answer: "Conversation busy (pending approval)" };
   }
 
+  // Ensure App Server is running
+  if (!isAppServerRunning()) {
+    log("App Server not running — starting...");
+    startAppServer();
+    // Wait up to 10s for it to come up
+    for (let i = 0; i < 10; i++) {
+      await new Promise(r => setTimeout(r, 1000));
+      if (isAppServerRunning()) break;
+    }
+    if (!isAppServerRunning()) {
+      log("App Server failed to start — falling back to REST API");
+      return tryDeliverOathRest(oath, targetConv);
+    }
+  }
+
   const prompt = buildDeliveryPrompt(oath);
-  log("Attempting delivery for " + oath.id + " to " + targetConv);
+  log("Attempting SDK delivery for " + oath.id + " to " + targetConv);
+
+  try {
+    const result = execSync(
+      `node "${DELIVERY_SCRIPT}" "${targetConv}" '${prompt.replace(/'/g, "'\\''")}'`,
+      { encoding: "utf8", timeout: 120_000, stdio: ["pipe", "pipe", "pipe"] }
+    );
+    const answer = result.trim();
+    if (answer.length === 0) {
+      log("Oath " + oath.id + " SDK delivery returned empty — conversation busy");
+      return { status: "busy", answer: "No response from SDK delivery" };
+    }
+    log("Oath " + oath.id + " delivered via SDK, answer length: " + answer.length);
+    return { status: "ok", answer };
+  } catch (e: any) {
+    const stderr = e.stderr ? String(e.stderr).trim() : "";
+    log("SDK delivery error for " + oath.id + ": " + (stderr || e.message || e));
+    // Fall back to REST API if SDK delivery fails
+    log("Falling back to REST API for " + oath.id);
+    return tryDeliverOathRest(oath, targetConv);
+  }
+}
+
+/** REST API fallback delivery — limited tools (server-side only) */
+async function tryDeliverOathRest(oath: Oath, targetConv: string): Promise<{ status: "ok" | "busy" | "fail"; answer: string }> {
+  const { baseUrl, apiKey } = getApiConfig();
+  const prompt = buildDeliveryPrompt(oath);
+  log("Attempting REST fallback delivery for " + oath.id + " to " + targetConv);
 
   try {
     const controller = new AbortController();
@@ -755,17 +855,14 @@ async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fa
       clearTimeout(readTimeout);
       reader.cancel().catch(() => {});
     }
-    // If no assistant_message was captured, the conversation was busy.
-    // The POST was accepted (200) but the agent hasn't responded yet.
-    // Treat as "busy" so the oath retries on the next poll cycle.
     if (answer.length === 0) {
-      log("Oath " + oath.id + " POST accepted but no response (conversation busy) — retrying");
+      log("Oath " + oath.id + " REST POST accepted but no response — retrying");
       return { status: "busy", answer: "No response in stream" };
     }
-    log("Oath " + oath.id + " delivered, answer length: " + answer.length);
+    log("Oath " + oath.id + " delivered via REST, answer length: " + answer.length);
     return { status: "ok", answer };
   } catch (e) {
-    log("Delivery error for " + oath.id + ": " + e);
+    log("REST delivery error for " + oath.id + ": " + e);
     return { status: "fail", answer: "Error: " + e };
   }
 }
@@ -881,7 +978,7 @@ async function pollDeliveryCycle() {
         updateStore.save();
         log("Oath " + queuedOath.id + " back to queued (busy)");
       } else if (result.status === "ok") {
-        updateStore.updateOath(queuedOath.id, { status: "delivered", deliveryMode: "rest_api", result: result.answer.slice(0, 500), deliveredAt: Date.now() });
+        updateStore.updateOath(queuedOath.id, { status: "delivered", deliveryMode: "sdk", result: result.answer.slice(0, 500), deliveredAt: Date.now() });
         updateStore.save();
         log("Oath " + queuedOath.id + " delivered");
       } else {
@@ -1050,6 +1147,9 @@ export default function activate(letta: any) {
 
   // Self-heal the env file on startup — discover correct port
   selfHealEnvFile();
+
+  // Start the App Server for SDK-based delivery (full tool access)
+  startAppServer();
 
   const hasTurnEvents = letta.capabilities.events?.turns === true;
   turnEventsActive = hasTurnEvents;
@@ -1253,5 +1353,6 @@ export default function activate(letta: any) {
     for (const d of disposers.reverse()) { try { d(); } catch (e) {}
     }
     if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+    stopAppServer();
   };
 }
