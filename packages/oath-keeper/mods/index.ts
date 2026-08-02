@@ -37,19 +37,24 @@ let appServerProcess: ReturnType<typeof spawn> | null = null;
 // unlike the REST API which only provides server-side tools via cloud relay.
 
 function discoverLettaBinary(): string {
+  // Try the shell shim first — it's maintained by the desktop app and always points to the working mount
+  const shim = "/tmp/letta-code-shell-shim/letta";
+  if (fs.existsSync(shim)) return shim;
+  // Fallback: find a working mount (not just one that exists — broken mounts have stale dirs)
   try {
-    // The AppImage mount path changes on each restart — discover it
     const mounts = fs.readdirSync("/tmp").filter(d => d.startsWith(".mount_letta-"));
     for (const mount of mounts) {
       const binary = `/tmp/${mount}/letta-code`;
       const js = `/tmp/${mount}/resources/app.asar.unpacked/node_modules/@letta-ai/letta-code/letta.js`;
-      if (fs.existsSync(binary) && fs.existsSync(js)) {
+      try {
+        // Actually try to access the binary — broken mounts will throw
+        fs.accessSync(binary, fs.constants.X_OK);
+        fs.accessSync(js, fs.constants.R_OK);
         return `${binary} ${js}`;
-      }
+      } catch (e) { /* mount is broken, try next */ }
     }
   } catch (e) {}
-  // Fallback to the shell shim
-  return "/tmp/letta-code-shell-shim/letta";
+  return "";
 }
 
 function isAppServerRunning(): boolean {
@@ -64,6 +69,8 @@ function isAppServerRunning(): boolean {
 function startAppServer(): void {
   if (isAppServerRunning()) { log("App Server already running on port " + APP_SERVER_PORT); return; }
   const binary = discoverLettaBinary();
+  if (!binary) { log("Cannot start App Server — no working letta binary found"); return; }
+  // The shim is a single path; the raw binary needs the js path appended
   const parts = binary.split(" ");
   log("Starting App Server: " + binary + " server --listen ws://127.0.0.1:" + APP_SERVER_PORT);
   try {
