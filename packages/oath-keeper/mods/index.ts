@@ -1032,9 +1032,16 @@ async function pollCycle() {
     const { convId } = getApiConfig();
     const agentIds = await discoverAgentIds();
     for (const scanAgentId of agentIds) {
-      const latest = await fetchLatestAgentMessage(scanAgentId);
+      const allMsgs = await fetchLatestAgentMessage(scanAgentId);
       const lastScanned = scanStore.getScannedForAgent(scanAgentId);
-      if (latest && lastScanned !== latest.id) {
+      if (!allMsgs) continue;
+
+      // Process ALL unscanned messages (oldest first), not just the latest one
+      const unscanned = lastScanned
+        ? allMsgs.filter(m => m.id !== lastScanned)
+        : allMsgs;
+
+      for (const latest of unscanned) {
         if (latest.isDeliveryResponse) { log("Skipping — delivery response"); scanStore.setScannedForAgent(scanAgentId, latest.id); scanStore.save(); continue; }
         const msgConvId = latest.conversationId || convId;
         const preFilter = detectPromiseRegex(latest.text);
@@ -1054,11 +1061,8 @@ async function pollCycle() {
 
           if (!confirmed) {
             logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, scanAgentId);
-            scanStore.setScannedForAgent(scanAgentId, latest.id);
-            scanStore.save();
           }
           if (confirmed) {
-            scanStore.setScannedForAgent(scanAgentId, latest.id);
             const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
                                   scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
             if (!alreadyExists) {
@@ -1066,14 +1070,12 @@ async function pollCycle() {
               oath.ngramScore = preFilter.score;
               oath.llmTokens = llmTokens;
               scanStore.addOath(oath);
-              scanStore.save();
               log("polling: oath created — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " conv=" + msgConvId.slice(0,12) + " score=" + preFilter.score + " delay=" + (confirmed.delayMs/1000) + "s");
             }
           }
-        } else {
-          scanStore.setScannedForAgent(scanAgentId, latest.id);
-          scanStore.save();
         }
+        scanStore.setScannedForAgent(scanAgentId, latest.id);
+        scanStore.save();
       }
     }
   } catch (e) {
@@ -1105,7 +1107,7 @@ async function discoverAgentIds(): Promise<string[]> {
 
 // ─── Message fetching ────────────────────────────────────────────
 
-async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string } | null> {
+async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string }[] | null> {
   const { baseUrl, apiKey, agentId: envAgentId, convId } = getApiConfig();
   const targetAgentId = scanAgentId || envAgentId;
   if (!targetAgentId) return null;
@@ -1116,64 +1118,68 @@ async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: stri
     const data: any = await resp.json();
     const messages = Array.isArray(data) ? data : (data.messages || []);
     if (!messages.length) return null;
-    messages.sort((a: any, b: any) => new Date(b.date || 0).getTime() - new Date(a.date || 0).getTime());
-    let assistantMsg: { id: string; text: string } | null = null;
-    let userContext = "(no context)";
-    let msgConversationId = convId;
+    // Sort oldest first so we can track the most recent user_message as context
+    messages.sort((a: any, b: any) => new Date(a.date || 0).getTime() - new Date(b.date || 0).getTime());
+
+    const results: { id: string; text: string; userContext: string; isDeliveryResponse: boolean; conversationId?: string }[] = [];
+    let lastUserContext = "(no context)";
+    let lastConvId = convId;
+
     for (const m of messages) {
       const mt = m.message_type || "";
 
-      // Check assistant_message for promise language
-      if (!assistantMsg && mt === "assistant_message") {
+      // Track the most recent user_message as context (for all messages after it)
+      if (mt === "user_message") {
         const c = m.content;
-        const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
-        if (text.trim()) {
-          assistantMsg = { id: m.id || "", text };
-          if (m.run_id) {
-            try {
-              const runResp = await fetch(baseUrl + "/v1/runs/" + m.run_id, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
-              if (runResp.ok) {
-                const run: any = await runResp.json();
-                if (run.conversation_id) msgConversationId = run.conversation_id;
-              }
-            } catch (e) {}
-          }
-        }
+        let text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+        if (text) lastUserContext = text.slice(0, 200);
+        continue;
       }
 
+      let msgText = "";
+      let msgId = m.id || "";
+      let msgRunId = m.run_id || "";
+
+      // Check assistant_message for promise language
+      if (mt === "assistant_message") {
+        const c = m.content;
+        text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
+        if (text.trim()) msgText = text;
+      }
       // Check MessageChannel tool calls for promise language
-      // Agents send messages to channels (Telegram, Discord) via MessageChannel —
-      // the promise text is in the tool call arguments, not the assistant message
-      if (!assistantMsg && mt === "approval_request_message" && m.tool_call) {
+      else if (mt === "approval_request_message" && m.tool_call) {
         const tc = m.tool_call;
         if (tc.name === "MessageChannel") {
           let args: any = tc.arguments;
           if (typeof args === "string") { try { args = JSON.parse(args); } catch (e) { args = {}; } }
-          const msgText = args.message || "";
-          if (msgText.trim() && msgText.length > 15) {
-            assistantMsg = { id: m.id || "", text: msgText };
-            if (m.run_id) {
-              try {
-                const runResp = await fetch(baseUrl + "/v1/runs/" + m.run_id, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
-                if (runResp.ok) {
-                  const run: any = await runResp.json();
-                  if (run.conversation_id) msgConversationId = run.conversation_id;
-                }
-              } catch (e) {}
-            }
-          }
+          const channelText = args.message || "";
+          if (channelText.trim() && channelText.length > 15) msgText = channelText;
         }
       }
 
-      if (userContext === "(no context)" && mt === "user_message") {
-        const c = m.content;
-        let text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
-        text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
-        if (text) userContext = text.slice(0, 200);
+      if (msgText.trim()) {
+        // Resolve conversation ID from run
+        let msgConvId = lastConvId;
+        if (msgRunId) {
+          try {
+            const runResp = await fetch(baseUrl + "/v1/runs/" + msgRunId, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+            if (runResp.ok) {
+              const run: any = await runResp.json();
+              if (run.conversation_id) { msgConvId = run.conversation_id; lastConvId = msgConvId; }
+            }
+          } catch (e) {}
+        }
+        results.push({
+          id: msgId,
+          text: msgText,
+          userContext: lastUserContext,
+          isDeliveryResponse: lastUserContext.includes("[Oath Keeper]"),
+          conversationId: msgConvId,
+        });
       }
-      if (assistantMsg && userContext !== "(no context)") break;
     }
-    return assistantMsg ? { ...assistantMsg, userContext, isDeliveryResponse: userContext.includes("[Oath Keeper]"), conversationId: msgConversationId } : null;
+    return results.length > 0 ? results : null;
   } catch (e) { log("fetchLatestAgentMessage error: " + e); return null; }
 }
 
