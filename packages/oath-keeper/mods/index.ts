@@ -299,7 +299,20 @@ class StateStore {
 
   save(): void {
     if (!this.dirty) { this.saved = true; return; }
-    try { fs.writeFileSync(STATE_FILE, JSON.stringify(this.data, null, 2)); this.saved = true; log(`StateStore.save() — SAVED after "${this.operation}"`); }
+    try {
+      // Re-read purgeEpoch from disk before saving — a stale StateStore
+      // might overwrite a purgeEpoch set by the TUI after this instance was loaded
+      try {
+        const disk = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+        if (disk.purgeEpoch && disk.purgeEpoch > (this.data.purgeEpoch || 0)) {
+          this.data.purgeEpoch = disk.purgeEpoch;
+          // Also filter out pre-purge oaths from our in-memory state
+          const before = this.data.oaths.length;
+          this.data.oaths = this.data.oaths.filter((o) => o.createdAt > disk.purgeEpoch);
+          if (before !== this.data.oaths.length) log(`StateStore.save: dropped ${before - this.data.oaths.length} pre-purge oaths on save`);
+        }
+      } catch (e) { /* file might not exist yet */ }
+      fs.writeFileSync(STATE_FILE, JSON.stringify(this.data, null, 2)); this.saved = true; log(`StateStore.save() — SAVED after \"${this.operation}\"`); }
     catch (e) { log(`StateStore.save() — FAILED: ${e}`); }
   }
 }
