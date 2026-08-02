@@ -453,6 +453,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let failed = sorted.iter().filter(|o| o.status == "failed").count();
             let false_pos = sorted.iter().filter(|o| o.status == "false_positive").count();
             let prefiltered = sorted.iter().filter(|o| o.status == "prefilter_rejected").count();
+            let llm_failed = sorted.iter().filter(|o| o.status == "llm_failed").count();
 
             let mut hdr = vec![
                 Span::styled(" Oath Keeper ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -466,6 +467,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             if failed > 0 { hdr.push(Span::styled(format!("  X:{}", failed), Style::default().fg(Color::Red))); }
             if false_pos > 0 { hdr.push(Span::styled(format!("  FP:{}", false_pos), Style::default().fg(Color::DarkGray))); }
             if prefiltered > 0 { hdr.push(Span::styled(format!("  PF:{}", prefiltered), Style::default().fg(Color::Magenta))); }
+            if llm_failed > 0 { hdr.push(Span::styled(format!("  LLM!:{}", llm_failed), Style::default().fg(Color::LightRed).add_modifier(Modifier::BOLD))); }
             if count == 0 { hdr.push(Span::styled("  empty", Style::default().fg(Color::DarkGray))); }
 
             // ── Filter status line ──
@@ -844,12 +846,22 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 let mut idx_map: Vec<usize> = (0..st.oaths.len()).collect();
                                 idx_map.sort_by(|&a, &b| st.oaths[b].created_at.cmp(&st.oaths[a].created_at));
                                 let real = idx_map[s];
-                                if st.oaths[real].status == "pending" {
+                                let cancellable = ["pending", "queued", "llm_failed"];
+                                if cancellable.contains(&st.oaths[real].status.as_str()) {
                                     st.oaths[real].status = "failed".into();
                                     st.oaths[real].result = Some("Cancelled".into());
                                     st.oaths[real].delivered_at = Some(now_ms);
                                     save_state(&st);
+                                    state_cache = Some(st);
+                                    state_mtime = fs::metadata(state_path())
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_millis() as i64)
+                                        .unwrap_or(0);
                                     status_msg = "Oath cancelled".to_string();
+                                } else {
+                                    status_msg = format!("Cannot cancel {} oath", st.oaths[real].status);
                                 }
                             }
                         }
@@ -941,13 +953,23 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 let mut idx_map: Vec<usize> = (0..st.oaths.len()).collect();
                                 idx_map.sort_by(|&a, &b| st.oaths[b].created_at.cmp(&st.oaths[a].created_at));
                                 let real = idx_map[s];
-                                if st.oaths[real].status == "pending" {
+                                let cancellable = ["pending", "queued", "llm_failed"];
+                                if cancellable.contains(&st.oaths[real].status.as_str()) {
                                     st.oaths[real].status = "failed".into();
                                     st.oaths[real].result = Some("Cancelled".into());
                                     st.oaths[real].delivered_at = Some(now_ms);
                                     save_state(&st);
+                                    state_cache = Some(st);
+                                    state_mtime = fs::metadata(state_path())
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_millis() as i64)
+                                        .unwrap_or(0);
                                     status_msg = "Oath cancelled".to_string();
                                     mode = Mode::List;
+                                } else {
+                                    status_msg = format!("Cannot cancel {} oath", st.oaths[real].status);
                                 }
                             }
                         }

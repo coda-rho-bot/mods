@@ -300,16 +300,32 @@ class StateStore {
   save(): void {
     if (!this.dirty) { this.saved = true; return; }
     try {
-      // Re-read purgeEpoch from disk before saving — a stale StateStore
-      // might overwrite a purgeEpoch set by the TUI after this instance was loaded
+      // Merge disk changes before saving — prevents stale StateStore from
+      // overwriting TUI mutations (purge, cancel, manual deliver)
       try {
         const disk = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+        // Preserve purgeEpoch
         if (disk.purgeEpoch && disk.purgeEpoch > (this.data.purgeEpoch || 0)) {
           this.data.purgeEpoch = disk.purgeEpoch;
-          // Also filter out pre-purge oaths from our in-memory state
           const before = this.data.oaths.length;
           this.data.oaths = this.data.oaths.filter((o) => o.createdAt > disk.purgeEpoch);
           if (before !== this.data.oaths.length) log(`StateStore.save: dropped ${before - this.data.oaths.length} pre-purge oaths on save`);
+        }
+        // Preserve status changes from disk (e.g., TUI cancelled an oath)
+        // If the disk version of an oath has a "terminal" status that our
+        // in-memory version doesn't, adopt the disk version
+        const diskOaths = new Map((disk.oaths || []).map((o: any) => [o.id, o]));
+        for (const oath of this.data.oaths) {
+          const diskOath = diskOaths.get(oath.id);
+          if (diskOath && diskOath.status !== oath.status) {
+            const terminal = ["failed", "delivered", "cancelled"];
+            if (terminal.includes(diskOath.status) && !terminal.includes(oath.status)) {
+              log(`StateStore.save: adopting disk status ${diskOath.status} for ${oath.id} (was ${oath.status})`);
+              oath.status = diskOath.status;
+              oath.result = diskOath.result;
+              oath.deliveredAt = diskOath.deliveredAt;
+            }
+          }
         }
       } catch (e) { /* file might not exist yet */ }
       fs.writeFileSync(STATE_FILE, JSON.stringify(this.data, null, 2)); this.saved = true; log(`StateStore.save() — SAVED after \"${this.operation}\"`); }
@@ -522,7 +538,7 @@ function logPreFilterRejection(text: string, reason: string, ngramScore?: number
  * ask the LLM to confirm whether it's a genuine promise to follow up later.
  * Returns the specific promise text or null if not a real promise.
  */
-async function confirmPromise(text: string): Promise<{ promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number } } | null> {
+async function confirmPromise(text: string): Promise<{ promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number }; error?: boolean; status?: number } | null> {
   const { baseUrl, apiKey } = getApiConfig();
   const classifierAgentId = getClassifierAgentId();
   if (!classifierAgentId) return null;
@@ -585,7 +601,7 @@ async function confirmPromise(text: string): Promise<{ promise: string; delayMs:
       });
     } catch (e) {}
 
-    if (!resp.ok) { log("confirmPromise: classification API " + resp.status); return null; }
+    if (!resp.ok) { log("confirmPromise: classification API " + resp.status); return { error: true, status: resp.status }; }
 
     const respText = await resp.text();
     let answer = "";
@@ -1037,6 +1053,14 @@ async function pollDeliveryCycle() {
         log("Oath " + oath.id + " stuck → queued");
       }
     }
+    // Retry llm_failed oaths every 5 minutes
+    const fiveMinAgoMs = now - 300_000;
+    for (const oath of resetStore.oaths) {
+      if (oath.status === "llm_failed" && oath.createdAt < fiveMinAgoMs) {
+        resetStore.updateOath(oath.id, { status: "pending" });
+        log("Oath " + oath.id + " llm_failed → pending (retry)");
+      }
+    }
     resetStore.prune(now);
     resetStore.save();
   } catch (e) {
@@ -1082,7 +1106,11 @@ async function pollCycle() {
 
           if (isLlmConfirmEnabled()) {
             confirmed = await confirmPromise(latest.text);
-            log("polling LLM: " + (confirmed ? "CONFIRMED: " + confirmed.promise.slice(0, 60) : "REJECTED"));
+            if (confirmed?.error) {
+              log("polling LLM: API error " + confirmed.status + " — creating oath with llm_failed status");
+            } else {
+              log("polling LLM: " + (confirmed ? "CONFIRMED: " + confirmed.promise.slice(0, 60) : "REJECTED"));
+            }
             if (confirmed?.tokens) llmTokens = confirmed.tokens;
           } else {
             confirmed = { promise: latest.text.slice(0, 300), delayMs: DEFAULT_DELAY_MS };
@@ -1092,7 +1120,15 @@ async function pollCycle() {
           if (!confirmed) {
             logFalsePositive(preFilter.match, latest.text, "polling", preFilter.score, msgConvId, scanAgentId);
           }
-          if (confirmed) {
+          if (confirmed?.error) {
+            // LLM failed (402, rate limit, etc.) — create oath with llm_failed status
+            const oath = createOath(latest.text.slice(0, 300), latest.userContext, msgConvId, scanAgentId, latest.id, "polling", DEFAULT_DELAY_MS);
+            oath.ngramScore = preFilter.score;
+            oath.status = "llm_failed";
+            scanStore.addOath(oath);
+            scanStore.save();
+            log("polling: oath created (llm_failed) — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " score=" + preFilter.score);
+          } else if (confirmed && !confirmed.error) {
             const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
                                   scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
             if (!alreadyExists) {
