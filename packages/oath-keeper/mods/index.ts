@@ -1094,19 +1094,26 @@ async function pollCycle() {
       for (const latest of unscanned) {
         if (latest.isDeliveryResponse) { log("Skipping — delivery response"); scanStore.setScannedForAgent(scanAgentId, latest.id); scanStore.save(); continue; }
         const msgConvId = latest.conversationId || convId;
+
+        // Dedup FIRST — if we already have an oath for this message, skip entirely
+        const existingOath = scanStore.oaths.find((o) => o.sourceMessageId === latest.id);
+        if (existingOath) {
+          scanStore.setScannedForAgent(scanAgentId, latest.id);
+          scanStore.save();
+          continue;
+        }
+
         const preFilter = detectPromiseRegex(latest.text);
         if (preFilter) {
-          log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
-
-          // Dedup check BEFORE LLM — saves tokens and prevents duplicates when LLM is unavailable
-          const alreadyScanned = scanStore.oaths.some((o) => o.sourceMessageId === latest.id) ||
-                                 scanStore.hasRecentPromise(latest.text.slice(0, 300));
-          if (alreadyScanned) {
-            log("Skipping — already have oath for this message");
+          // Text-based dedup — similar promise text already tracked
+          if (scanStore.hasRecentPromise(latest.text.slice(0, 300))) {
+            log("Skipping — similar promise already tracked");
             scanStore.setScannedForAgent(scanAgentId, latest.id);
             scanStore.save();
             continue;
           }
+
+          log("Regex pre-filter matched: " + preFilter.match + " — confirming with LLM");
 
           let confirmed: { promise: string; delayMs: number; tokens?: { prompt: number; completion: number; total: number }; error?: boolean; status?: number } | null = null;
           let llmTokens: { prompt: number; completion: number; total: number } | undefined;
