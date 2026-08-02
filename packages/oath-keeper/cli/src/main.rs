@@ -373,6 +373,10 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     let mut mode = Mode::List;
     let mut status_msg = String::new();
 
+    // State cache — only reload when file mtime changes
+    let mut state_cache: Option<State> = None;
+    let mut state_mtime: i64 = 0;
+
     // Caches with TTL to avoid subprocess spawns every frame
     let mut crons_cache: Vec<CronTask> = Vec::new();
     let mut crons_ts: i64 = 0;
@@ -383,7 +387,19 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
 
     loop {
         let now_ms = Local::now().timestamp_millis();
-        let state = load_state();
+
+        // Only reload state when the file has actually changed on disk
+        let current_mtime = fs::metadata(state_path())
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        if state_cache.is_none() || current_mtime != state_mtime {
+            state_cache = Some(load_state());
+            state_mtime = current_mtime;
+        }
+        let state = state_cache.as_ref().unwrap();
 
         // Refresh crons at most every 30s
         let crons = if now_ms - crons_ts > 30_000 {
@@ -777,6 +793,13 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let mut st = load_state();
                             st.oaths.clear();
                             save_state(&st);
+                            state_cache = Some(st);
+                            state_mtime = fs::metadata(state_path())
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
                             list_state.select(Some(0));
                             status_msg = "Purged all oaths".to_string();
                         }
@@ -785,7 +808,14 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let before = st.oaths.len();
                             st.oaths.retain(|o| o.status != "prefilter_rejected" && o.status != "false_positive");
                             save_state(&st);
-                            let removed = before - st.oaths.len();
+                            state_cache = Some(st);
+                            state_mtime = fs::metadata(state_path())
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            let removed = before - state_cache.as_ref().unwrap().oaths.len();
                             status_msg = format!("Cleared {} filtered entries", removed);
                         }
                         KeyCode::Char('C') => {
@@ -795,7 +825,14 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                                 o.status == "pending" || o.status == "queued" || o.status == "delivering"
                             });
                             save_state(&st);
-                            let removed = before - st.oaths.len();
+                            state_cache = Some(st);
+                            state_mtime = fs::metadata(state_path())
+                                .and_then(|m| m.modified())
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0);
+                            let removed = before - state_cache.as_ref().unwrap().oaths.len();
                             status_msg = format!("Cleared {} completed entries", removed);
                         }
                         KeyCode::Char('x') => {
