@@ -267,6 +267,9 @@ class StateStore {
       if (o.status === "pending" || o.status === "queued" || o.status === "delivering") return true;
       // Prune prefilter_rejected after 10 minutes (they're just debug noise)
       if (o.status === "prefilter_rejected" && o.deliveredAt && (now - o.deliveredAt) > 600_000) return false;
+      // Prune llm_failed after 10 minutes
+      if (o.status === "llm_failed" && o.deliveredAt && (now - o.deliveredAt) > 600_000) return false;
+      if (o.status === "llm_failed" && (now - o.createdAt) > 600_000) return false;
       // Prune false_positive after 30 minutes
       if (o.status === "false_positive" && o.deliveredAt && (now - o.deliveredAt) > 1_800_000) return false;
       // Prune delivered/failed after 24 hours
@@ -1053,14 +1056,7 @@ async function pollDeliveryCycle() {
         log("Oath " + oath.id + " stuck → queued");
       }
     }
-    // Retry llm_failed oaths every 5 minutes
-    const fiveMinAgoMs = now - 300_000;
-    for (const oath of resetStore.oaths) {
-      if (oath.status === "llm_failed" && oath.createdAt < fiveMinAgoMs) {
-        resetStore.updateOath(oath.id, { status: "pending" });
-        log("Oath " + oath.id + " llm_failed → pending (retry)");
-      }
-    }
+    // Prune llm_failed after 10 minutes (same as prefilter_rejected)
     resetStore.prune(now);
     resetStore.save();
   } catch (e) {
@@ -1122,12 +1118,17 @@ async function pollCycle() {
           }
           if (confirmed?.error) {
             // LLM failed (402, rate limit, etc.) — create oath with llm_failed status
-            const oath = createOath(latest.text.slice(0, 300), latest.userContext, msgConvId, scanAgentId, latest.id, "polling", DEFAULT_DELAY_MS);
-            oath.ngramScore = preFilter.score;
-            oath.status = "llm_failed";
-            scanStore.addOath(oath);
-            scanStore.save();
-            log("polling: oath created (llm_failed) — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " score=" + preFilter.score);
+            // BUT check dedup first — don't create duplicates
+            const alreadyExists = scanStore.hasRecentPromise(latest.text.slice(0, 300)) ||
+                                  scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
+            if (!alreadyExists) {
+              const oath = createOath(latest.text.slice(0, 300), latest.userContext, msgConvId, scanAgentId, latest.id, "polling", DEFAULT_DELAY_MS);
+              oath.ngramScore = preFilter.score;
+              oath.status = "llm_failed";
+              scanStore.addOath(oath);
+              scanStore.save();
+              log("polling: oath created (llm_failed) — " + oath.id + " agent=" + scanAgentId.slice(0,12) + " score=" + preFilter.score);
+            }
           } else if (confirmed && !confirmed.error) {
             const alreadyExists = scanStore.hasRecentPromise(confirmed.promise) ||
                                   scanStore.oaths.some((o) => o.sourceMessageId === latest.id);
