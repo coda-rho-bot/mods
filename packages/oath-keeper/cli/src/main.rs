@@ -816,6 +816,8 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             let mut st = load_state();
                             st.oaths.clear();
                             st.purge_epoch = Some(Local::now().timestamp_millis());
+                            st.last_scanned_message_ids = None;
+                            st.last_scanned_message_id = None;
                             save_state(&st);
                             state_cache = Some(st);
                             state_mtime = fs::metadata(state_path())
@@ -1051,6 +1053,8 @@ fn main() {
         let mut st = load_state();
         st.oaths.clear();
         st.purge_epoch = Some(Local::now().timestamp_millis());
+        st.last_scanned_message_ids = None;
+        st.last_scanned_message_id = None;
         save_state(&st);
         println!("Purged.");
         return;

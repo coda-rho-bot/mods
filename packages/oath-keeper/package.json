@@ -1,6 +1,6 @@
 {
   "name": "@coda-rho-bot/oath-keeper",
-  "version": "1.4.3",
+  "version": "1.4.4",
   "description": "Passively detects when agents make follow-up promises and automatically delivers on them. Cron is for things you plan. Oath Keeper is for things you promise.",
   "author": "coda-rho-bot",
   "license": "Apache-2.0",
