@@ -498,13 +498,13 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                 let model_display = if fs_status.classifier_model.is_empty() { "unknown".to_string() } else { fs_status.classifier_model.clone() };
                 Line::from(vec![
                     Span::raw(" Filters: "),
+                    Span::styled("DEDUP:on", Style::default().fg(Color::Green)),
+                    Span::raw("  "),
                     Span::styled(neg_label, Style::default().fg(neg_color)),
                     Span::raw("  "),
                     Span::styled(ngram_label, Style::default().fg(ngram_color)),
                     Span::raw("  "),
                     Span::styled(llm_label, Style::default().fg(llm_color)),
-                    Span::raw("  "),
-                    Span::styled(dedup_label, Style::default().fg(dedup_color)),
                     Span::raw("  Model: "),
                     Span::styled(model_display, Style::default().fg(Color::Cyan)),
                 ])
