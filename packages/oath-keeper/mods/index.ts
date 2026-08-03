@@ -252,6 +252,7 @@ class StateStore {
   setScanned(msgId: string): StateStore { this.data.lastScannedMessageId = msgId; this.dirty = true; return this; }
   setScannedForAgent(agentId: string, msgId: string): StateStore {
     if (!this.data.lastScannedMessageIds) this.data.lastScannedMessageIds = {};
+    if (this.data.lastScannedMessageIds[agentId] === msgId) return this; // no change, no dirty
     this.data.lastScannedMessageIds[agentId] = msgId;
     this.dirty = true;
     return this;
@@ -283,6 +284,7 @@ class StateStore {
   get lastScannedMessageId(): string | null { return this.data.lastScannedMessageId; }
   get pollVer(): string { return this.data._pollVer; }
   setPurgeEpoch(ts: number): StateStore { this.data.purgeEpoch = ts; this.dirty = true; return this; }
+  clearScannedIds(): StateStore { this.data.lastScannedMessageIds = {}; this.data.lastScannedMessageId = null; this.dirty = true; return this; }
   hasActiveOaths(): boolean { return this.data.oaths.some((o) => o.status === "pending" || o.status === "queued" || o.status === "delivering"); }
 
   /** Get active oaths (pending, queued, or delivering) for LLM dedup comparison */
