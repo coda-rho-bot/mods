@@ -144,7 +144,7 @@ function isNgramEnabled(): boolean {
 /** Get n-gram score threshold (default: 1.25) */
 function getNgramThreshold(): number {
   const config = loadConfig();
-  return typeof config.ngramThreshold === "number" ? config.ngramThreshold : 1;
+  return typeof config.ngramThreshold === "number" ? config.ngramThreshold : 3.0;
 }
 
 /** Check if LLM confirmation is enabled (default: false) */
@@ -418,7 +418,7 @@ async function isDuplicatePromise(newPromise: string, existingOaths: Oath[]): Pr
 // ─── Promise Detection ───────────────────────────────────────────
 
 const PROMISE_PATTERNS: Array<[RegExp, number]> = [
-  // Strong signals (3.0) — explicit future-tense promises
+  // Strong signals (3.0) — explicit delayed follow-up promises
   [/i'll get back to/i, 3.0],
   [/i'll follow up/i, 3.0],
   [/i'll circle back/i, 3.0],
@@ -426,19 +426,27 @@ const PROMISE_PATTERNS: Array<[RegExp, number]> = [
   [/follow up (?:on|with|in)/i, 3.0],
   [/i'll let you know/i, 3.0],
   [/i'll update you/i, 3.0],
+  [/i'll report (?:back|on)/i, 3.0],
+  [/i'll keep you (?:posted|informed|updated)/i, 3.0],
   [/check back (?:in|with|later|after)/i, 2.5],
 
-  // Moderate signals (2.0) — future-tense intent with specific action
-  [/i'll (?:check|verify|look into|investigate|research|dig into|confirm)/i, 2.0],
-  [/i'll (?:send|provide|share|post|publish|deliver)/i, 2.0],
+  // Moderate signals (2.0) — requires temporal anchor to be meaningful
+  [/i'll (?:check|verify|look into|investigate|research|dig into|confirm).*(?:later|after|when|once|in \d)/i, 2.0],
   [/i'll (?:have|get) (?:an answer|results|something|a response)/i, 2.5],
-  [/i'll tell you.*(?:later|after|when)/i, 2.5],
+  [/i'll tell you.*(?:when|after|once|if|whether)/i, 2.5],
+  [/i'll check in (?:on|with|later|after)/i, 2.5],
+  [/i'll monitor/i, 2.0],
+  [/i'll (?:ping|notify|alert) you/i, 2.0],
+  [/i'll revisit/i, 2.0],
+  [/(?:once|when|after).*(?:i'll|i will|let you know)/i, 2.0],
 
-  // Weak signals (1.0-1.5) — immediate actions (NOT promises to follow up later)
+  // Weak signals (1.0) — immediate actions, NOT promises (need stacking to pass)
+  [/i'll (?:check|verify|look into|investigate|research|dig into|confirm)/i, 1.0],
+  [/i'll (?:send|provide|share|post|publish|deliver)/i, 1.0],
   [/i (?:will|shall) (?:check|verify|look|investigate|research|test|review|analyze)/i, 1.0],
   [/i'm going to (?:check|verify|look|investigate|research|test|review)/i, 1.0],
-  [/(?:in|after) (?:\d+|a few|some) (?:minutes|seconds|hours|moments)/i, 1.5],
-  [/\blater (?:today|this week|tonight)\b/i, 1.0],
+  [/i'll.*(?:in|after) (?:\d+|a few|some) (?:minutes|seconds|hours|moments)/i, 1.5],
+  [/i'll.*later (?:today|this week|tonight)/i, 1.0],
 ];
 
 function computeNgramScore(text: string): number {
@@ -453,11 +461,13 @@ function detectPromiseRegex(text: string): { match: string; score: number } | nu
   if (!text || typeof text !== "string") return null;
   if (text.includes("[Oath Keeper]") || text.includes("[Oath Delivered]")) return null;
 
-  // Negative filter (Stage 0): skip short and code-heavy messages
+  // Negative filter (Stage 0): skip short, code-heavy, or quoted messages
   if (isNegativeFilterEnabled()) {
-    if (text.trim().length < 15) return null;
-    const codeChars = (text.match(/[{}()[\];=]/g) || []).length;
-    if (text.length > 50 && codeChars / text.length > 0.05) return null;
+    // Strip fenced code blocks and blockquotes before analysis
+    const cleaned = text.replace(/```[\s\S]*?```/g, '').replace(/^>.*$/gm, '').trim();
+    if (cleaned.length < 25) return null;
+    const codeChars = (cleaned.match(/[{}()[\];=]/g) || []).length;
+    if (cleaned.length > 50 && codeChars / cleaned.length > 0.15) return null;
   }
 
   const score = computeNgramScore(text);
