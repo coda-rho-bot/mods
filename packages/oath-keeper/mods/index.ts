@@ -1097,10 +1097,16 @@ async function pollCycle() {
       const lastScanned = scanStore.getScannedForAgent(scanAgentId);
       if (!allMsgs) continue;
 
-      // Process ALL unscanned messages (oldest first), not just the latest one
-      const unscanned = lastScanned
-        ? allMsgs.filter(m => m.id !== lastScanned)
-        : allMsgs;
+      // Process only messages NEWER than the last scanned one.
+      // Messages are sorted oldest-first, so find the index of the last scanned
+      // and only process messages after it.
+      let unscanned: typeof allMsgs;
+      if (lastScanned) {
+        const lastIdx = allMsgs.findIndex(m => m.id === lastScanned);
+        unscanned = lastIdx >= 0 ? allMsgs.slice(lastIdx + 1) : [];
+      } else {
+        unscanned = allMsgs;
+      }
 
       for (const latest of unscanned) {
         if (latest.isDeliveryResponse) { log("Skipping — delivery response"); scanStore.setScannedForAgent(scanAgentId, latest.id); scanStore.save(); continue; }
