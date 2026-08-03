@@ -941,16 +941,6 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                             status_msg = format!("LLM: {}", if !current { "on" } else { "off" });
                         }
                         KeyCode::Char('4') => {
-                            let mut cfg = load_config();
-                            let current = cfg.llm_dedup.unwrap_or(false);
-                            cfg.llm_dedup = Some(!current);
-                            save_config(&cfg);
-                            update_filter_status_from_config(&cfg);
-                            filter_cache = None;
-                            filter_ts = 0;
-                            status_msg = format!("DEDUP: {}", if !current { "on" } else { "off" });
-                        }
-                        KeyCode::Char('5') => {
                             let models = fetch_models();
                             let mut cfg = load_config();
                             let current = cfg.classifier_model.clone().unwrap_or_else(|| "letta/auto-fast".to_string());
