@@ -978,6 +978,7 @@ async function pollDeliveryCycle() {
                   checkChanged = true;
                   log("Oath " + oath.id + " confirmed delivered (found in conversation history)");
                 } else {
+                  // Delivery prompt sent but no response yet — mark as delivering to prevent re-delivery
                   checkStore.updateOath(oath.id, { status: "delivering" });
                   checkChanged = true;
                   log("Oath " + oath.id + " delivery prompt found in history (waiting for response)");
@@ -1293,19 +1294,22 @@ export default function activate(letta: any) {
 
         // ── STEP 1: Check for queued oaths ready for delivery (via { continue })
         // This uses the mod event surface instead of REST API — tools work properly
-        const deliverStore = StateStore.load("turn_end-deliver");
-        const dueOath = deliverStore.oaths.find((o) =>
-          (o.status === "queued") &&
-          o.conversationId === eventConvId
-        );
+        // Guard: don't deliver if the last assistant message was already an [Oath Keeper] delivery
+        if (!lastMsg.includes("[Oath Keeper]") && !lastMsg.includes("[Oath Delivered]")) {
+          const deliverStore = StateStore.load("turn_end-deliver");
+          const dueOath = deliverStore.oaths.find((o) =>
+            (o.status === "queued") &&
+            o.conversationId === eventConvId
+          );
 
-        if (dueOath) {
-          log("turn_end: delivering oath via { continue } — " + dueOath.id);
-          deliverStore.updateOath(dueOath.id, { status: "delivering", deliveryMode: "turn_end" });
-          deliverStore.save();
+          if (dueOath) {
+            log("turn_end: delivering oath via { continue } — " + dueOath.id);
+            deliverStore.updateOath(dueOath.id, { status: "delivering", deliveryMode: "turn_end" });
+            deliverStore.save();
 
-          const prompt = buildDeliveryPrompt(dueOath);
-          return { continue: prompt };
+            const prompt = buildDeliveryPrompt(dueOath);
+            return { continue: prompt };
+          }
         }
 
         // ── STEP 2: Mark delivered oaths if the response contains [Oath Delivered]
