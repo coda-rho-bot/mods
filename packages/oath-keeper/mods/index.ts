@@ -692,7 +692,7 @@ function createOath(promise: string, context: string, conversationId: string, ag
 // Cache the last-known-good port to avoid ss on every call
 let cachedBaseUrl: string | null = null;
 let lastPortCheck: number = 0;
-const PORT_CHECK_INTERVAL = 60_000; // re-verify port every 60s
+const PORT_CHECK_INTERVAL = 10_000; // re-verify port every 10s (was 60s, too slow after restart)
 
 /** Discover the current Letta Code server port via ss.
  *  Called on startup to self-heal the stale env file. */
