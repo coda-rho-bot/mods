@@ -390,11 +390,18 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
     loop {
         let now_ms = Local::now().timestamp_millis();
 
-        // Fixed-interval polling: reload state every 2 seconds.
-        // Immune to the mod's rapid write cycles — the TUI sees a consistent
-        // snapshot regardless of how many times the file changes between polls.
-        if state_cache.is_none() || now_ms - state_last_reload > 2000 {
-            state_cache = Some(load_state());
+        // Fixed-interval polling every 3 seconds.
+        // Merge main state + prefilter entries (from separate file).
+        if state_cache.is_none() || now_ms - state_last_reload > 3000 {
+            let mut new_state = load_state();
+            // Load prefiltered entries from separate file and merge
+            let pf_path = state_path().with_file_name("oath-keeper-prefiltered.json");
+            if let Ok(pf_data) = fs::read_to_string(&pf_path) {
+                if let Ok(pf_entries) = serde_json::from_str::<Vec<Oath>>(&pf_data) {
+                    new_state.oaths.extend(pf_entries);
+                }
+            }
+            state_cache = Some(new_state);
             state_last_reload = now_ms;
         }
         let state = state_cache.as_ref().unwrap();

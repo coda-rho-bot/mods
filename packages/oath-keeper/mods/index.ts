@@ -266,8 +266,7 @@ class StateStore {
     this.data.oaths = this.data.oaths.filter((o) => {
       // Always keep active oaths
       if (o.status === "pending" || o.status === "queued" || o.status === "delivering") return true;
-      // Prune prefilter_rejected after 10 minutes (they're just debug noise)
-      if (o.status === "prefilter_rejected" && o.deliveredAt && (now - o.deliveredAt) > 600_000) return false;
+      // prefilter_rejected entries are in a separate file now, not pruned from main state
       // Prune llm_failed after 10 minutes
       if (o.status === "llm_failed" && o.deliveredAt && (now - o.deliveredAt) > 600_000) return false;
       if (o.status === "llm_failed" && (now - o.createdAt) > 600_000) return false;
@@ -516,16 +515,17 @@ function logFalsePositive(matchedPattern: string, text: string, source: string, 
 
 /** Log a pre-filter rejection — message didn't score high enough for LLM classification */
 function logPreFilterRejection(text: string, reason: string, ngramScore?: number, conversationId?: string, agentId?: string) {
+  // Write to a SEPARATE file, not the main state file.
+  // This prevents the create+prune cycle from causing TUI flickering.
   try {
-    const store = StateStore.load("prefilter-reject");
-    const textSnippet = text.slice(0, 60);
-    const exists = store.oaths.some((o) =>
-      o.status === "prefilter_rejected" &&
-      o.promise.includes(textSnippet)
-    );
-    if (exists) return;
+    const PREFILTER_FILE = `${HOME}/.letta/mods/oath-keeper-prefiltered.json`;
+    let entries: any[] = [];
+    try { entries = JSON.parse(fs.readFileSync(PREFILTER_FILE, "utf8")); } catch (e) {}
+    // Dedup
+    const snippet = text.slice(0, 60);
+    if (entries.some((e) => e.promise.includes(snippet))) return;
     const now = Date.now();
-    store.addOath({
+    entries.push({
       id: "pf-" + now + "-" + Math.random().toString(36).slice(2, 6),
       conversationId: conversationId || "",
       agentId: agentId || "",
@@ -538,8 +538,10 @@ function logPreFilterRejection(text: string, reason: string, ngramScore?: number
       deliveredAt: now,
       ngramScore,
     });
-    store.save();
-    log("Pre-filter rejected: " + reason + " (score=" + (ngramScore ?? 0) + ") — " + textSnippet);
+    // Keep last 50 entries
+    if (entries.length > 50) entries = entries.slice(-50);
+    fs.writeFileSync(PREFILTER_FILE, JSON.stringify(entries, null, 2));
+    log("Pre-filter rejected: " + reason + " (score=" + (ngramScore ?? 0) + ") — " + snippet);
   } catch (e) { log("logPreFilterRejection error: " + e); }
 }
 
