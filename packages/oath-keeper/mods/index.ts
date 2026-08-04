@@ -1371,7 +1371,7 @@ export default function activate(letta: any) {
           const preFilter = detectPromiseRegex(msgText);
           if (!preFilter) {
             const rejectScore = computeNgramScore(msgText);
-            logPreFilterRejection(msgText, "ngram score <= 1.5 or negative filter", rejectScore, eventConvId, eventAgentId);
+            logPreFilterRejection(msgText, `score ${rejectScore} < ${getNgramThreshold()} or negative filter`, rejectScore, eventConvId, eventAgentId);
             return;
           }
           ngramScore = preFilter.score;
