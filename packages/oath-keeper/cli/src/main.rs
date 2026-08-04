@@ -888,13 +888,30 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         }
                         KeyCode::Char('2') => {
                             let mut cfg = load_config();
-                            let current = cfg.ngram_filter.unwrap_or(true);
-                            cfg.ngram_filter = Some(!current);
+                            let enabled = cfg.ngram_filter.unwrap_or(true);
+                            let threshold = cfg.ngram_threshold.unwrap_or(3.0);
+                            if !enabled {
+                                // Off → turn on at threshold 1
+                                cfg.ngram_filter = Some(true);
+                                cfg.ngram_threshold = Some(1.0);
+                                status_msg = "NGRAM: on (>1)".to_string();
+                            } else if threshold <= 1.0 {
+                                // ≥1 → ≥2
+                                cfg.ngram_threshold = Some(2.0);
+                                status_msg = "NGRAM: on (>2)".to_string();
+                            } else if threshold <= 2.0 {
+                                // ≥2 → ≥3
+                                cfg.ngram_threshold = Some(3.0);
+                                status_msg = "NGRAM: on (>3)".to_string();
+                            } else {
+                                // ≥3 → off
+                                cfg.ngram_filter = Some(false);
+                                status_msg = "NGRAM: off".to_string();
+                            }
                             save_config(&cfg);
                             update_filter_status_from_config(&cfg);
                             filter_cache = None;
                             filter_ts = 0;
-                            status_msg = format!("NGRAM: {}", if !current { "on" } else { "off" });
                         }
                         KeyCode::Char('3') => {
                             let mut cfg = load_config();
