@@ -516,10 +516,31 @@ function logFalsePositive(matchedPattern: string, text: string, source: string, 
 
 /** Log a pre-filter rejection — message didn't score high enough for LLM classification */
 function logPreFilterRejection(text: string, reason: string, ngramScore?: number, conversationId?: string, agentId?: string) {
-  // Slash and burn: don't create state entries for prefilter rejections.
-  // Just log to debug file. This eliminates the create+prune cycle that
-  // causes TUI flickering between oath list and empty state.
-  log("Pre-filter rejected: " + reason + " (score=" + (ngramScore ?? 0) + ") — " + text.slice(0, 60));
+  try {
+    const store = StateStore.load("prefilter-reject");
+    const textSnippet = text.slice(0, 60);
+    const exists = store.oaths.some((o) =>
+      o.status === "prefilter_rejected" &&
+      o.promise.includes(textSnippet)
+    );
+    if (exists) return;
+    const now = Date.now();
+    store.addOath({
+      id: "pf-" + now + "-" + Math.random().toString(36).slice(2, 6),
+      conversationId: conversationId || "",
+      agentId: agentId || "",
+      promise: text.slice(0, 120),
+      context: reason,
+      createdAt: now,
+      dueAt: now,
+      status: "prefilter_rejected",
+      result: reason,
+      deliveredAt: now,
+      ngramScore,
+    });
+    store.save();
+    log("Pre-filter rejected: " + reason + " (score=" + (ngramScore ?? 0) + ") — " + textSnippet);
+  } catch (e) { log("logPreFilterRejection error: " + e); }
 }
   } catch (e) {
     log("Failed to log pre-filter rejection: " + e);
