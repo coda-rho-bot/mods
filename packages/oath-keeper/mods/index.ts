@@ -542,10 +542,6 @@ function logPreFilterRejection(text: string, reason: string, ngramScore?: number
     log("Pre-filter rejected: " + reason + " (score=" + (ngramScore ?? 0) + ") — " + textSnippet);
   } catch (e) { log("logPreFilterRejection error: " + e); }
 }
-  } catch (e) {
-    log("Failed to log pre-filter rejection: " + e);
-  }
-}
 
 /**
  * LLM confirmation — given a candidate message that matched the regex pre-filter,
