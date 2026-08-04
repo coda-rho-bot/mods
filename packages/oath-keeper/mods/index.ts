@@ -1231,6 +1231,7 @@ async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: stri
       }
 
       let msgText = "";
+      let mcText = "";
       let msgId = m.id || "";
       let msgRunId = m.run_id || "";
 
@@ -1240,32 +1241,44 @@ async function fetchLatestAgentMessage(scanAgentId?: string): Promise<{ id: stri
         const text = typeof c === "string" ? c : Array.isArray(c) ? c.map((x: any) => typeof x === "string" ? x : (x?.text || "")).join(" ") : "";
         if (text.trim()) msgText = text;
       }
-      // Check MessageChannel tool calls for promise language
-      else if (mt === "approval_request_message" && m.tool_call) {
+      // Check MessageChannel tool calls (NOT else-if — same message ID can have both)
+      if (mt === "approval_request_message" && m.tool_call) {
         const tc = m.tool_call;
         if (tc.name === "MessageChannel") {
           let args: any = tc.arguments;
           if (typeof args === "string") { try { args = JSON.parse(args); } catch (e) { args = {}; } }
           const channelText = args.message || "";
-          if (channelText.trim() && channelText.length > 15) msgText = channelText;
+          if (channelText.trim() && channelText.length > 15) mcText = channelText;
         }
       }
 
+      // Resolve conversation ID from run (once per message ID)
+      let msgConvId = lastConvId;
+      if (msgRunId) {
+        try {
+          const runResp = await fetch(baseUrl + "/v1/runs/" + msgRunId, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
+          if (runResp.ok) {
+            const run: any = await runResp.json();
+            if (run.conversation_id) { msgConvId = run.conversation_id; lastConvId = msgConvId; }
+          }
+        } catch (e) {}
+      }
+
+      // Add assistant_message result
       if (msgText.trim()) {
-        // Resolve conversation ID from run
-        let msgConvId = lastConvId;
-        if (msgRunId) {
-          try {
-            const runResp = await fetch(baseUrl + "/v1/runs/" + msgRunId, { headers: apiKey ? { Authorization: "Bearer " + apiKey } : {} });
-            if (runResp.ok) {
-              const run: any = await runResp.json();
-              if (run.conversation_id) { msgConvId = run.conversation_id; lastConvId = msgConvId; }
-            }
-          } catch (e) {}
-        }
         results.push({
-          id: msgId,
+          id: msgId + ":asst",
           text: msgText,
+          userContext: lastUserContext,
+          isDeliveryResponse: lastUserContext.includes("[Oath Keeper]"),
+          conversationId: msgConvId,
+        });
+      }
+      // Add MessageChannel result (separate from assistant_message, different suffix)
+      if (mcText.trim()) {
+        results.push({
+          id: msgId + ":mc",
+          text: mcText,
           userContext: lastUserContext,
           isDeliveryResponse: lastUserContext.includes("[Oath Keeper]"),
           conversationId: msgConvId,
