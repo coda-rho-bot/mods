@@ -1375,21 +1375,24 @@ export default function activate(letta: any) {
         if (isLlmConfirmEnabled()) {
           log("turn_end: sending to LLM...");
           detection = await confirmPromise(msgText);
+
+          if (detection?.error) {
+            // LLM failed (402, rate limit) — create llm_failed oath
+            log("turn_end LLM: API error " + detection.status + " — creating llm_failed oath");
+            const oath = createOath(msgText.slice(0, 300), "(turn_end)", eventConvId, eventAgentId, undefined, "turn_end", DEFAULT_DELAY_MS);
+            oath.ngramScore = ngramScore;
+            oath.status = "llm_failed";
+            scanStore.addOath(oath);
+            scanStore.save();
+            return;
+          }
+
           log("turn_end LLM: " + (detection ? "CONFIRMED: " + detection.promise.slice(0, 60) + " delay=" + (detection.delayMs/1000) + "s" : "REJECTED"));
 
           if (detection?.tokens) llmTokens = detection.tokens;
 
           if (!detection) {
             logFalsePositive("llm", msgText, "turn_end", ngramScore, eventConvId, eventAgentId);
-            // Store tokens on the false positive entry
-            if (llmTokens) {
-              const fpStore = StateStore.load("turn_end-fp-tokens");
-              const fpEntry = fpStore.oaths[fpStore.oaths.length - 1];
-              if (fpEntry) {
-                fpStore.updateOath(fpEntry.id, { llmTokens });
-                fpStore.save();
-              }
-            }
             scanStore.save();
             return;
           }
