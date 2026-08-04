@@ -408,7 +408,8 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             // Mtime changed — but wait for it to stabilize
             if state_pending_mtime == 0 {
                 state_pending_mtime = current_mtime;
-            } else if current_mtime == state_pending_mtime && now_ms - state_pending_ts > 300 {
+                state_pending_ts = now_ms;
+            } else if current_mtime == state_pending_mtime && now_ms - state_pending_ts > 500 {
                 // Stable for 300ms — reload now
                 state_cache = Some(load_state());
                 state_mtime = current_mtime;
