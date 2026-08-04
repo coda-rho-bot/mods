@@ -391,10 +391,19 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
         let now_ms = Local::now().timestamp_millis();
 
         // Fixed-interval polling: reload state every 2 seconds.
-        // Immune to the mod's rapid write cycles — the TUI sees a consistent
-        // snapshot regardless of how many times the file changes between polls.
-        if state_cache.is_none() || now_ms - state_last_reload > 2000 {
-            state_cache = Some(load_state());
+        // Fixed-interval polling every 3 seconds.
+        // Anti-flicker: if new state has 0 oaths but previous had some,
+        // keep showing the previous state for one more cycle.
+        // This prevents flashing to empty when the mod's multi-phase
+        // write cycle produces a momentarily-empty file.
+        if state_cache.is_none() || now_ms - state_last_reload > 3000 {
+            let new_state = load_state();
+            let prev_count = state_cache.as_ref().map(|s| s.oaths.len()).unwrap_or(0);
+            if new_state.oaths.is_empty() && prev_count > 0 {
+                // Keep previous state — likely an intermediate write
+            } else {
+                state_cache = Some(new_state);
+            }
             state_last_reload = now_ms;
         }
         let state = state_cache.as_ref().unwrap();
