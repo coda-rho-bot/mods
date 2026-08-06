@@ -320,7 +320,7 @@ fn api_get(path: &str) -> Option<serde_json::Value> {
     let cache = ENV_CACHE.get_or_init(|| std::sync::Mutex::new((String::new(), String::new(), 0)));
     let mut guard = cache.lock().unwrap();
     let now = Local::now().timestamp_millis();
-    if guard.2 == 0 || now - guard.2 > 60_000 {
+    if guard.2 == 0 || now - guard.2 > 10_000 {
         let (base, key) = get_env();
         guard.0 = base;
         guard.1 = key;
@@ -477,7 +477,7 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
             let fs_status = filter_cache.as_ref().unwrap();
             let neg_label = if fs_status.negative_filter { "NEG:on" } else { "NEG:off" };
             let neg_color = if fs_status.negative_filter { Color::Green } else { Color::Red };
-            let ngram_label = format!("NGRAM:{} (>{}{})", if fs_status.ngram { "on" } else { "off" }, fs_status.ngram_threshold, "");
+            let ngram_label = if fs_status.ngram { format!("NGRAM:on (>={})", fs_status.ngram_threshold as u64) } else { "NGRAM:off".to_string() };
             let ngram_color = if fs_status.ngram { Color::Green } else { Color::Red };
             let llm_label = if fs_status.llm_confirm { "LLM:on" } else { "LLM:off" };
             let llm_color = if fs_status.llm_confirm { Color::Green } else { Color::Red };
@@ -888,13 +888,26 @@ fn run_tui(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<
                         }
                         KeyCode::Char('2') => {
                             let mut cfg = load_config();
-                            let current = cfg.ngram_filter.unwrap_or(true);
-                            cfg.ngram_filter = Some(!current);
+                            let enabled = cfg.ngram_filter.unwrap_or(true);
+                            let threshold = cfg.ngram_threshold.unwrap_or(3.0);
+                            if !enabled {
+                                cfg.ngram_filter = Some(true);
+                                cfg.ngram_threshold = Some(1.0);
+                                status_msg = "NGRAM: on (>=1)".to_string();
+                            } else if threshold <= 1.0 {
+                                cfg.ngram_threshold = Some(2.0);
+                                status_msg = "NGRAM: on (>=2)".to_string();
+                            } else if threshold <= 2.0 {
+                                cfg.ngram_threshold = Some(3.0);
+                                status_msg = "NGRAM: on (>=3)".to_string();
+                            } else {
+                                cfg.ngram_filter = Some(false);
+                                status_msg = "NGRAM: off".to_string();
+                            }
                             save_config(&cfg);
                             update_filter_status_from_config(&cfg);
                             filter_cache = None;
                             filter_ts = 0;
-                            status_msg = format!("NGRAM: {}", if !current { "on" } else { "off" });
                         }
                         KeyCode::Char('3') => {
                             let mut cfg = load_config();

@@ -736,7 +736,7 @@ function selfHealEnvFile() {
   }
 }
 
-function getApiConfig() {
+function getApiConfig(forceRefresh: boolean = false) {
   let apiKey = process.env.LETTA_API_KEY;
   if (apiKey === "unset") apiKey = undefined;
   let agentId = "";
@@ -752,7 +752,7 @@ function getApiConfig() {
 
   // Priority: cached (if checked recently) → process.env → env file → ss discovery → default
   // Re-verify the port every 60s to handle app restarts
-  if (cachedBaseUrl && (now - lastPortCheck) < PORT_CHECK_INTERVAL) {
+  if (cachedBaseUrl && (now - lastPortCheck) < PORT_CHECK_INTERVAL && !forceRefresh) {
     return { baseUrl: cachedBaseUrl, apiKey, agentId, convId };
   }
 
@@ -884,7 +884,7 @@ async function tryDeliverOath(oath: Oath): Promise<{ status: "ok" | "busy" | "fa
 
 /** REST API fallback delivery — limited tools (server-side only) */
 async function tryDeliverOathRest(oath: Oath, targetConv: string): Promise<{ status: "ok" | "busy" | "fail"; answer: string }> {
-  const { baseUrl, apiKey } = getApiConfig();
+  const { baseUrl, apiKey } = getApiConfig(true); // force port refresh for delivery
   const prompt = buildDeliveryPrompt(oath);
   log("Attempting REST fallback delivery for " + oath.id + " to " + targetConv);
 
@@ -1371,7 +1371,7 @@ export default function activate(letta: any) {
           const preFilter = detectPromiseRegex(msgText);
           if (!preFilter) {
             const rejectScore = computeNgramScore(msgText);
-            logPreFilterRejection(msgText, "ngram score <= 1.5 or negative filter", rejectScore, eventConvId, eventAgentId);
+            logPreFilterRejection(msgText, `score ${rejectScore} < ${getNgramThreshold()} or negative filter`, rejectScore, eventConvId, eventAgentId);
             return;
           }
           ngramScore = preFilter.score;
